@@ -3,17 +3,9 @@ from poke_env.player import Player
 
 class RandomAgent(Player):
     """
-    Baseline agent that picks a random move.
-    Connects to the public Pokémon Showdown server.
+    Random move agent for Pokémon Showdown.
+    Works with latest poke-env (connects to the public server automatically).
     """
-
-    def __init__(self, battle_format):
-        super().__init__(
-            battle_format=battle_format,
-            server="sim.smogon.com",  # public server
-            port=443,                  # HTTPS port
-            use_ssl=True               
-        )
 
     def choose_move(self, battle):
         if battle.available_moves:
