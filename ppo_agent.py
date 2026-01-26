@@ -1,4 +1,6 @@
 import asyncio
+import os
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -18,15 +20,23 @@ class PolicyNetwork(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
+
 # ---- PPO Agent ----
 class PPOAgent(Player):
-    def __init__(self, battle_format="gen9randombattle", log_level=30):
+    def __init__(self, battle_format="gen9randombattle", log_level=30, log_file="training_log.json"):
         super().__init__(battle_format=battle_format, log_level=log_level)
         self.policy = PolicyNetwork(input_size=10, hidden_size=64, output_size=4)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=1e-3)
         self.last_log_prob = None
+        self.log_file = log_file
+
+        # Ensure log file exists
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, "w") as f:
+                f.write("")
 
     def choose_move(self, battle):
+        """Sample a move using the policy network"""
         x = self.battle_to_tensor(battle)
         logits = self.policy(x)
         m = Categorical(logits=logits)
@@ -39,22 +49,21 @@ class PPOAgent(Player):
         return self.choose_random_move(battle)
 
     def battle_to_tensor(self, battle):
+        """Simplified battle state as tensor"""
         my_hp = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
         opp_hp = battle.opponent_active_pokemon.current_hp_fraction if battle.opponent_active_pokemon else 0
-        status = 0
+        status = 0  # placeholder
         tensor = torch.tensor([my_hp, opp_hp, status] + [0]*7, dtype=torch.float32)
         return tensor
 
     async def on_battle_end(self, battle, won):
-        """Update policy after battle ends."""
-        my_hp_frac = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
-        opp_hp_frac = battle.opponent_active_pokemon.current_hp_fraction if battle.opponent_active_pokemon else 0
+        """Calculate reward and update policy"""
+        my_hp = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
+        opp_hp = battle.opponent_active_pokemon.current_hp_fraction if battle.opponent_active_pokemon else 0
 
         # Base reward
         reward = 1.0 if won else -1.0
-
-        # Add HP difference
-        reward += 0.5 * (my_hp_frac - opp_hp_frac)
+        reward += 0.5 * (my_hp - opp_hp)  # scaled HP difference
 
         # Update policy
         if self.last_log_prob is not None:
@@ -63,17 +72,34 @@ class PPOAgent(Player):
             loss.backward()
             self.optimizer.step()
 
+        # Log reward to file
+        with open(self.log_file, "a") as f:
+            f.write(json.dumps({
+                "won": won,
+                "my_hp_frac": my_hp,
+                "opp_hp_frac": opp_hp,
+                "reward": reward
+            }) + "\n")
+            f.flush()
+
+        # Print battle outcome
+        print(f"Battle finished | Won: {won} | Reward: {reward:.2f} | My HP: {my_hp:.2f} | Opponent HP: {opp_hp:.2f}")
+
 
 # ---- Training function ----
 async def train():
     agent = PPOAgent()
     opponent = RandomPlayer(battle_format="gen9randombattle")
-    n_battles = 5  # small for testing
 
+    n_battles = 50  # number of battles to train on
+
+    print("Starting training...\n")
     for i in range(n_battles):
         print(f"Starting battle {i+1}...")
         await agent.battle_against(opponent, n_battles=1)
-    print("Training finished.")
+
+    print("\nTraining finished!")
+
 
 # ---- Run ----
 if __name__ == "__main__":
