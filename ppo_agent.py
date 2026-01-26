@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 from poke_env.player import Player
 from poke_env.player.baselines import SimpleHeuristicsPlayer
 
+
 # ---- Neural Network ----
 class PolicyNetwork(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -19,43 +20,42 @@ class PolicyNetwork(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
+
 # ---- PPO Agent ----
 class PPOAgent(Player):
-    def __init__(self, battle_format="gen9randombattle", log_level=30):
+    def __init__(self, battle_format="gen1randombattle", log_level=30):
         super().__init__(battle_format=battle_format, log_level=log_level)
         self.policy = PolicyNetwork(input_size=10, hidden_size=64, output_size=4)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=1e-3)
         self.last_log_prob = None
-
-        # Track moves manually
-        self._last_moves = []
+        self._last_moves = []  # Track moves per battle
 
     def choose_move(self, battle):
         try:
-            # Create input tensor
             x = self.battle_to_tensor(battle)
             logits = self.policy(x)
             m = Categorical(logits=logits)
             action_idx = m.sample()
             self.last_log_prob = m.log_prob(action_idx)
 
-            # Pick move safely
-            available = [m for m in battle.available_moves if m.id not in ("mirrormove", "metronome", "assist", "transform", "copycat")]
-            if available:
-                move = available[action_idx.item() % len(available)]
-                # Track move for reward
-                self._last_moves.append({
-                    "move": move.id,
-                    "damage_done": getattr(move, "damage_done", 0),
-                    "damage_taken": getattr(move, "damage_taken", 0),
-                    "super_effective": getattr(move, "super_effective", False)
-                })
-                return self.create_order(move)
-            else:
+            # Avoid problematic moves
+            available = [
+                m for m in battle.available_moves
+                if m.id not in ("mirrormove", "metronome", "assist", "transform", "copycat")
+            ]
+            if not available:
                 return self.choose_random_move(battle)
 
+            move = available[action_idx.item() % len(available)]
+            # Track move info for reward
+            self._last_moves.append({
+                "move_obj": move,
+                "damage_done": getattr(move, "damage_done", 0),
+                "damage_taken": getattr(move, "damage_taken", 0),
+            })
+            return self.create_order(move)
+
         except Exception as e:
-            # Skip problematic moves
             print("Skipping unhandled move:", e)
             return self.choose_random_move(battle)
 
@@ -63,7 +63,15 @@ class PPOAgent(Player):
         my_hp = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
         opp_hp = battle.opponent_active_pokemon.current_hp_fraction if battle.opponent_active_pokemon else 0
         status = 0
+        # Pad to 10 features (placeholder)
         return torch.tensor([my_hp, opp_hp, status] + [0]*7, dtype=torch.float32)
+
+    def move_effectiveness(self, move, opponent):
+        """Return type effectiveness multiplier"""
+        try:
+            return move.type.damage_multiplier(opponent.types)
+        except Exception:
+            return 1.0
 
     async def on_battle_end(self, battle, won):
         my_hp = battle.active_pokemon.current_hp_fraction if battle.active_pokemon else 0
@@ -73,16 +81,19 @@ class PPOAgent(Player):
         reward = 1.0 if won else -1.0
         reward += 0.5 * (my_hp - opp_hp)
 
-        # Heuristic bonuses
-        for move in self._last_moves:
-            if move.get("super_effective", False):
-                reward += 0.03
-            reward += 0.02 * move.get("damage_done", 0)
-            reward -= 0.01 * move.get("damage_taken", 0)
+        # Bonus for moves
+        for move_info in self._last_moves:
+            move = move_info.get("move_obj")
+            if move:
+                multiplier = self.move_effectiveness(move, battle.opponent_active_pokemon)
+                if multiplier > 1.0:
+                    reward += 0.03  # super effective bonus
+            reward += 0.02 * move_info.get("damage_done", 0)
+            reward -= 0.01 * move_info.get("damage_taken", 0)
 
-        # Bonus for fainted enemy Pokémon
-        fainted_enemies = sum(1 for p in battle.opponent_team.values() if p.current_hp == 0)
-        reward += 0.05 * fainted_enemies
+        # Bonus for fainted opponent Pokémon
+        fainted_own = sum(1 for p in battle.team.values() if p.current_hp == 0)
+        reward -= 0.05 * fainted_own  # penalize losing Pokémon
 
         # Update policy
         if self.last_log_prob is not None:
@@ -91,18 +102,19 @@ class PPOAgent(Player):
             loss.backward()
             self.optimizer.step()
 
-        # Clear moves for next battle
+        # Clear move history
         self._last_moves = []
 
-        # Print outcome
-        print(f"Battle finished | Won: {won} | Reward: {reward:.2f} | My HP: {my_hp:.2f} | Opponent HP: {opp_hp:.2f} | Fainted enemies: {fainted_enemies}")
+        # Print summary
+        print(f"Battle finished | Won: {won} | Reward: {reward:.2f} | My HP: {my_hp:.2f} | Opponent HP: {opp_hp:.2f} | Fainted: {fainted_enemies}")
 
 
 # ---- Training function ----
 async def train():
     agent = PPOAgent()
-    opponent = SimpleHeuristicsPlayer(battle_format="gen9randombattle")  # safe heuristic agent
-    n_battles = 500
+    opponent = SimpleHeuristicsPlayer(battle_format="gen1randombattle")
+
+    n_battles = 800
 
     print("Starting training...\n")
     for i in range(n_battles):
