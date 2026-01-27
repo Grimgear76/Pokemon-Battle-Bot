@@ -79,7 +79,13 @@ class PPOAgent(Player):
 
         # Base reward
         reward = 1.0 if won else -1.0
-        reward += 0.5 * (my_hp - opp_hp)
+        # Total HP fraction of your team
+        my_total_hp = sum(p.current_hp_fraction for p in battle.team.values())
+        opp_total_hp = sum(p.current_hp_fraction for p in battle.opponent_team.values())
+
+        # Reward proportional to total HP difference
+        reward += 0.5 * (my_total_hp - opp_total_hp)
+
 
         # Bonus for moves
         for move_info in self._last_moves:
@@ -114,7 +120,7 @@ async def train():
     agent = PPOAgent()
     opponent = SimpleHeuristicsPlayer(battle_format="gen1randombattle")
 
-    n_battles = 800
+    n_battles = 2000
 
     print("Starting training...\n")
     for i in range(n_battles):
