@@ -6,6 +6,7 @@ from torch.distributions import Categorical
 
 from poke_env.player import Player
 from poke_env.player.baselines import SimpleHeuristicsPlayer
+from poke_env.player.baselines import MaxBasePowerPlayer
 from poke_env.player.baselines import RandomPlayer
 from poke_env.data import GenData
 
@@ -47,7 +48,7 @@ class PolicyNetwork(nn.Module):
 # PPO Agent 
 # ----------------------------
 class PPOAgent(Player):
-    def __init__(self, battle_format="gen1randombattle", log_level=30):
+    def __init__(self, battle_format="gen5randombattle", log_level=30):
         super().__init__(battle_format=battle_format, log_level=log_level)
 
         # Updated input size: 2 (HP) + 18 (my types) + 18 (opp types) + 12 (4 moves × 3 features)
@@ -248,9 +249,13 @@ class PPOAgent(Player):
 # ----------------------------
 async def train():
     agent = PPOAgent()
-    opponent = SimpleHeuristicsPlayer(battle_format="gen1randombattle")
 
-    n_battles = 2000
+    #opponent = SimpleHeuristicsPlayer(battle_format="gen5randombattle")
+
+    opponent = MaxBasePowerPlayer(battle_format="gen5randombattle")
+    #opponent = RandomPlayer(battle_format="gen5randombattle")
+
+    n_battles = 3000
     print("Starting training...\n")
 
     for i in range(n_battles):
