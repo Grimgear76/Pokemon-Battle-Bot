@@ -32,17 +32,23 @@ def model_path(name) -> Path:
     return MODEL_DIR / f"{name}.zip"
 
 
-# Custom Environment with custom rewards, observations, 
+# embed_battle return vector size (must match the actual return size)
+OBS_SIZE = 42
+
+# Custom Environment
 class CustomEnv(SinglesEnv):
-    LOW = [-1, -1, -1, -1, 0, 0, 0, 0, 0, 0]
-    HIGH = [3, 3, 3, 3, 4, 4, 4, 4, 1, 1]
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.observation_spaces = {
-            agent: Box(np.array(self.LOW, dtype=np.float32), np.array(self.HIGH, dtype=np.float32), dtype=np.float32)
-            for agent in self.possible_agents
-        }
+        agent: Box(
+            low=-1.0,
+            high=1.0,
+            shape=(OBS_SIZE,),
+            dtype=np.float32
+        )
+        for agent in self.possible_agents
+    }
 
     # create environment function (single agent)
     @classmethod
@@ -58,70 +64,157 @@ class CustomEnv(SinglesEnv):
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
-    # Rewarding function
+    # Rewarding function (calculates per turn) - need to create a reward system
     def calc_reward(self, battle) -> float:
-        return self.reward_computing_helper(battle, fainted_value=2.0, hp_value=1.0, victory_value=30.0)
+        reward = self.reward_computing_helper(battle, fainted_value=2.0, hp_value=1.0, victory_value=30.0)
+        #print (reward)
+        #print ("------------------------------------------------------------------")
+        return reward
 
 
-    # Observer function
+    # Observer function [-1, 1]
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, Battle)
-        moves_base_power = -np.ones(4)
-        moves_dmg_multiplier = np.ones(4)
+        moves = 4
+        pokemon_team = 6
+        moves_base_power = -np.ones(moves)
+        moves_dmg_multiplier = np.ones(moves)
+        moves_pp_ratio = np.zeros(moves)
+        team_hp_ratio = np.ones(pokemon_team)
+        opponent_hp_ratio = np.ones(pokemon_team)
+        opponent_team_status = np.ones(pokemon_team, dtype=np.float32)
+        self_team_status = np.ones(pokemon_team, dtype=np.float32)
+        team_identifier = np.zeros(pokemon_team, dtype=np.float32)
 
-        # move power
+
+        # hp percentages of both my team and the enemy
+        for i, (_, mon) in enumerate(sorted(battle.team.items())):
+            if mon.fainted or mon.max_hp == 0:
+                team_hp_ratio[i] = -1.0
+            else:
+                team_hp_ratio[i] = (mon.current_hp / mon.max_hp) * 2 - 1
+
+        for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
+            if mon.fainted or mon.max_hp == 0:
+                opponent_hp_ratio[i] = -1.0
+            else:
+                opponent_hp_ratio[i] = (mon.current_hp / mon.max_hp) * 2 - 1
+
+        # moves
         for i, move in enumerate(battle.available_moves):
-            moves_base_power[i] = (move.base_power / 100)
+            # move base_power
+            if move.base_power is not None:
+                moves_base_power[i] = (move.base_power / 250) * 2 - 1
+            else:
+                moves_base_power[i] = 0.0
+
             # move damage multiplier
             if battle.opponent_active_pokemon is not None:
-                moves_dmg_multiplier[i] = move.type.damage_multiplier(
-                    battle.opponent_active_pokemon.type_1,
-                    battle.opponent_active_pokemon.type_2,
-                    type_chart=GenData.from_gen(battle.gen).type_chart
-                )
-        # move pp (add this feature)
+                moves_dmg_multiplier[i] = np.clip(
+                    move.type.damage_multiplier(
+                        battle.opponent_active_pokemon.type_1,
+                        battle.opponent_active_pokemon.type_2,
+                        type_chart=GenData.from_gen(battle.gen).type_chart
+                    ) - 1.0, -1.0, 1.0) # Normalized to [-1, 1]
 
-        # We count how many pokemons have fainted in each team
-        fainted_mon_team = (len([mon for mon in battle.team.values() if mon.fainted]) / 6)
-        fainted_mon_opponent = (len([mon for mon in battle.opponent_team.values() if mon.fainted]) / 6)
+            # move pp
+            moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
 
-        # Pokemon team (add this feature)
+        # Encoded team composition (1 = alive, -1 = fainted)
+        for i, mon in enumerate(battle.team.values()):
+            if mon.fainted:
+                self_team_status[i] = -1.0
 
-        # Final vector with 10 components
+        # Encoded enemy team composition (1 = alive, -1 = fainted)
+        for i, mon in enumerate(battle.opponent_team.values()):
+            if mon.fainted:
+                opponent_team_status[i] = -1.0 
+
+        # Pokemon team - pokemon team's identifiers
+        pokedex = GenData.from_gen(battle.gen).pokedex
+        species_list = list(pokedex.keys())
+
+        for i, (_, mon) in enumerate(sorted(battle.team.items())):
+            if mon is not None and mon.species is not None:
+                mons_species_id = mon.species.lower() # species to lower‑case
+                if mons_species_id in species_list:
+                    idx = species_list.index(mons_species_id)
+                    team_identifier[i] = (idx / (len(species_list) - 1)) * 2 - 1 
+                else:
+                    team_identifier[i] = 0.0  # unknown
+            else:
+                team_identifier[i] = -1  # no mon
+
+        # Final vector with 42 components
         final_vector = np.concatenate(
             [
-                moves_base_power,
-                moves_dmg_multiplier,
-                [fainted_mon_team, fainted_mon_opponent],
+                moves_base_power, # 4
+                moves_dmg_multiplier, # 4
+                moves_pp_ratio, # 4
+                self_team_status, # 6
+                opponent_team_status, # 6
+                team_hp_ratio, # 6
+                opponent_hp_ratio, # 6
+                team_identifier, # 6
             ]
         )
         # observation vector
         return np.float32(final_vector)
     
 
-# masking function (fixing masking)
+    # reset function to make sure env resets after each battle
+    def reset(self, *args, **kwargs):
+        obs, infos = super().reset(*args, **kwargs)
+        print("Environment reset! New battle started.")
+        return obs, infos
+
+    # close function to make sure the env closes after each interval
+    def close(self):
+        super().close()
+        print("Environment closed.")
+            # add proper closing to the final battle
+
+
+# masking function
 def mask_env(env):
     # unwrap ActionMasker -> SingleAgentWrapper -> CustomEnv
-    poke_env = env.env.battle1
-
+    battle = env.env.battle1
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
-    
-    battle = poke_env
-    if battle is None:
+
+    if battle is None or battle.active_pokemon is None:
         return action_mask
+
+    # forced states 
+    # - recharge replaces the move that needs recharging ex: [1,2,Hyper_beam,4] -> [1,2,recharge,4]. problem because the initial list doesn't account for recharge
+    # - [/choosing move 1] being the only valid order (idk what it pertains to or what conditions need to be met) - maybe dig or encore
+
+
+
 
     # available moves
     move_offset = 6 
-    for i, move in enumerate(battle.available_moves):
-        action_mask[i + move_offset] = 1
+    available = set(battle.available_moves)
+    moves = list(battle.active_pokemon.moves.values())
 
+    for slot, move in enumerate(moves):
+        if move in available:
+            action_mask[slot + move_offset] = 1
+
+    # available switches 
+    team = list(battle.team.values())
+    available_switches = set(battle.available_switches)
+
+    for slot, mon in enumerate(team):
+        if mon in available_switches:
+            action_mask[slot] = 1
     
-    for i in range(len(battle.available_switches)): 
-        action_mask[i] = 1
-    
-    print (battle.available_moves)
-    print (battle.available_switches)
-    print ("--------------------------------------------------------------------------------")
+   
+    #print (action_mask)
+    #print (team)
+    #print (moves)
+    #print (battle.available_moves)
+    #print (battle.available_switches)
+    #print ("--------------------------------------------------------------------------------")
 
     return action_mask
 
@@ -157,7 +250,7 @@ def train_new(model_name, timesteps):
 if __name__ == "__main__":
     MODE = "new"   # "new" | "continue" | "eval"
     MODEL_NAME = "testTrash"
-    training_steps = 6000
+    training_steps = 2000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
