@@ -33,7 +33,7 @@ def model_path(name) -> Path:
 
 
 # embed_battle return vector size (must match the actual return size)
-OBS_SIZE = 42
+OBS_SIZE = 44
 ACTION_SPACE_SIZE = 11
 
 # Custom Environment
@@ -56,6 +56,19 @@ class CustomEnv(SinglesEnv):
             agent: Discrete(ACTION_SPACE_SIZE)
             for agent in self.possible_agents
         }
+
+        self.gen_data = GenData.from_gen(1)  # or dynamic if needed
+
+        self.species_to_id = {
+            name: i for i, name in enumerate(self.gen_data.pokedex.keys())
+}
+    def action_to_order(self, action, battle, fake = False, strict = True):
+        # Remap action 10 to default
+        if action == 10:
+            action = -2
+
+        # Call the original Player.action_to_order
+        return super().action_to_order(action, battle, fake=fake, strict=strict)
 
     # environment function (single agent)
     @classmethod
@@ -80,6 +93,7 @@ class CustomEnv(SinglesEnv):
     # Observer function [-1, 1]
     def embed_battle(self, battle: AbstractBattle):
         assert isinstance(battle, Battle)
+        #print("Current turn:", battle.turn)
         moves = 4
         pokemon_team = 6
         moves_base_power = -np.ones(moves)
@@ -90,6 +104,7 @@ class CustomEnv(SinglesEnv):
         opponent_team_status = np.ones(pokemon_team, dtype=np.float32)
         self_team_status = np.ones(pokemon_team, dtype=np.float32)
         team_identifier = np.zeros(pokemon_team, dtype=np.float32)
+        special_case = np.zeros(2, dtype=np.float32)
 
         # hp percentages of team
         for i, (_, mon) in enumerate(sorted(battle.team.items())):
@@ -118,7 +133,7 @@ class CustomEnv(SinglesEnv):
                     move.type.damage_multiplier(
                         battle.opponent_active_pokemon.type_1,
                         battle.opponent_active_pokemon.type_2,
-                        type_chart=GenData.from_gen(battle.gen).type_chart
+                        type_chart=self.gen_data.type_chart
                     ) - 1.0, -1.0, 1.0) # Normalized to [-1, 1]
 
             # move pp
@@ -135,7 +150,7 @@ class CustomEnv(SinglesEnv):
                 opponent_team_status[i] = -1.0 
 
         # Pokemon team - pokemon team's identifiers
-        pokedex = GenData.from_gen(battle.gen).pokedex
+        pokedex = self.gen_data.pokedex
         species_list = list(pokedex.keys())
 
         for i, (_, mon) in enumerate(sorted(battle.team.items())):
@@ -151,8 +166,14 @@ class CustomEnv(SinglesEnv):
 
         # Active pokemon types (Need to add)
 
-        
-        # Final vector | 42 components
+
+        # Special case
+        if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
+            special_case[0] = 1 
+        if battle.active_pokemon.must_recharge:
+            special_case[1] = 1
+
+        # Final vector | 43 components
         final_vector = np.concatenate(
             [
                 moves_base_power, # 4
@@ -163,9 +184,12 @@ class CustomEnv(SinglesEnv):
                 team_hp_ratio, # 6
                 opponent_hp_ratio, # 6
                 team_identifier, # 6
+                special_case, # 2
             ]
         )
         
+        #print (special_case)
+
         return np.float32(final_vector)
     
 
@@ -180,6 +204,12 @@ class CustomEnv(SinglesEnv):
         super().close()
         print("Environment closed.")
             # add proper closing to the final battle
+    
+    def step(self, action): 
+        #print (action)
+        #print("------------------------------------------------------------------------------------------------------------------------")
+        obs, reward, terminated, truncated, info = super().step(action)
+        return obs, reward, terminated, truncated, info
 
 
 # masking function
@@ -189,8 +219,10 @@ def mask_env(env):
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
 
     if battle is None or battle.active_pokemon is None:
-        print (action_mask)
-        print ("--------------------------------------------------------------------------------")
+        #print (action_mask)
+        #print (battle.available_moves)
+        #print (battle.available_switches)
+        #print ("--------------------------------------------------------------------------------")
         return action_mask
 
     team = list(battle.team.values())
@@ -198,20 +230,26 @@ def mask_env(env):
     moves = list(battle.active_pokemon.moves.values())
     available_moves = set(battle.available_moves)
     move_offset = 6
-    choose_default = 0
+    choose_default = 10
     
 
     # forced states 
-    # - /choose default (10)
+    # - /choose default
     if len(available_moves) == 0 and len(available_switches) == 0:
-        action_mask[choose_default] = 1
-        print (action_mask)
-        print ("--------------------------------------------------------------------------------")
+        action_mask[choose_default] = 1 # return default choice
+        #print (action_mask)
+        #print (battle.available_moves)
+        #print (battle.available_switches)
+        #print ("--------------------------------------------------------------------------------")
         return action_mask
 
-    if battle.active_pokemon.must_recharge: # only problem rn
-        action_mask[10] = 1
-        #return action_mask
+    if battle.active_pokemon.must_recharge: 
+        action_mask[choose_default] = 1  # return default choice
+        #print (action_mask)
+        #print (battle.available_moves)
+        #print (battle.available_switches)
+        #print ("--------------------------------------------------------------------------------")
+        return action_mask
 
     # available moves 6 - 9
     if not battle.force_switch or not battle.active_pokemon.fainted:
@@ -225,12 +263,12 @@ def mask_env(env):
             action_mask[slot] = 1
     
    
-    print (action_mask)
+    #print (action_mask)
     #print (team)
     #print (moves)
     #print (battle.available_moves)
     #print (battle.available_switches)
-    print ("--------------------------------------------------------------------------------")
+    #print ("--------------------------------------------------------------------------------")
 
     return action_mask
 
