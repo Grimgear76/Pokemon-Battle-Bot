@@ -21,7 +21,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from poke_env.battle import AbstractBattle, Battle
 from poke_env.data import GenData
 from poke_env.environment import SingleAgentWrapper, SinglesEnv
-from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
+from poke_env.player import DefaultBattleOrder, RandomPlayer, SimpleHeuristicsPlayer
 from poke_env import AccountConfiguration
 
 
@@ -34,33 +34,38 @@ def model_path(name) -> Path:
 
 # embed_battle return vector size (must match the actual return size)
 OBS_SIZE = 42
+ACTION_SPACE_SIZE = 11
 
 # Custom Environment
 class CustomEnv(SinglesEnv):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.observation_spaces = {
-        agent: Box(
-            low=-1.0,
-            high=1.0,
-            shape=(OBS_SIZE,),
-            dtype=np.float32
-        )
-        for agent in self.possible_agents
-    }
 
-    # create environment function (single agent)
+        self.observation_spaces = {
+            agent: Box(
+                low=-1.0,
+                high=1.0,
+                shape=(OBS_SIZE,),
+                dtype=np.float32
+            )
+            for agent in self.possible_agents
+        }
+
+        self.action_spaces = {
+            agent: Discrete(ACTION_SPACE_SIZE)
+            for agent in self.possible_agents
+        }
+
+    # environment function (single agent)
     @classmethod
     def create_single_agent_env(cls, config: Dict[str, Any]) -> SingleAgentWrapper:
         agent_config = AccountConfiguration("agent", None)
         opponent_config = AccountConfiguration("random_bot", None)
 
-        # Class Constructor
-        env = cls(battle_format=config["battle_format"], log_level=25, open_timeout=None, strict=False, account_configuration1=agent_config, account_configuration2=opponent_config)
-        
+        # Constructor
+        env = cls(battle_format=config["battle_format"], log_level=30, open_timeout=None, strict=False, account_configuration1=agent_config, account_configuration2=opponent_config)
         opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
-        
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
@@ -86,14 +91,13 @@ class CustomEnv(SinglesEnv):
         self_team_status = np.ones(pokemon_team, dtype=np.float32)
         team_identifier = np.zeros(pokemon_team, dtype=np.float32)
 
-
-        # hp percentages of both my team and the enemy
+        # hp percentages of team
         for i, (_, mon) in enumerate(sorted(battle.team.items())):
             if mon.fainted or mon.max_hp == 0:
                 team_hp_ratio[i] = -1.0
             else:
                 team_hp_ratio[i] = (mon.current_hp / mon.max_hp) * 2 - 1
-
+        # hp percentages of enemy team
         for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
             if mon.fainted or mon.max_hp == 0:
                 opponent_hp_ratio[i] = -1.0
@@ -145,7 +149,10 @@ class CustomEnv(SinglesEnv):
             else:
                 team_identifier[i] = -1  # no mon
 
-        # Final vector with 42 components
+        # Active pokemon types (Need to add)
+
+        
+        # Final vector | 42 components
         final_vector = np.concatenate(
             [
                 moves_base_power, # 4
@@ -158,14 +165,14 @@ class CustomEnv(SinglesEnv):
                 team_identifier, # 6
             ]
         )
-        # observation vector
+        
         return np.float32(final_vector)
     
 
     # reset function to make sure env resets after each battle
     def reset(self, *args, **kwargs):
         obs, infos = super().reset(*args, **kwargs)
-        print("Environment reset! New battle started.")
+        #print("Environment reset! New battle started.")
         return obs, infos
 
     # close function to make sure the env closes after each interval
@@ -182,39 +189,48 @@ def mask_env(env):
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
 
     if battle is None or battle.active_pokemon is None:
+        print (action_mask)
+        print ("--------------------------------------------------------------------------------")
         return action_mask
 
-    # forced states 
-    # - recharge replaces the move that needs recharging ex: [1,2,Hyper_beam,4] -> [1,2,recharge,4]. problem because the initial list doesn't account for recharge
-    # - [/choosing move 1] being the only valid order (idk what it pertains to or what conditions need to be met) - maybe dig or encore
-
-
-
-
-    # available moves
-    move_offset = 6 
-    available = set(battle.available_moves)
-    moves = list(battle.active_pokemon.moves.values())
-
-    for slot, move in enumerate(moves):
-        if move in available:
-            action_mask[slot + move_offset] = 1
-
-    # available switches 
     team = list(battle.team.values())
     available_switches = set(battle.available_switches)
+    moves = list(battle.active_pokemon.moves.values())
+    available_moves = set(battle.available_moves)
+    move_offset = 6
+    choose_default = 0
+    
 
+    # forced states 
+    # - /choose default (10)
+    if len(available_moves) == 0 and len(available_switches) == 0:
+        action_mask[choose_default] = 1
+        print (action_mask)
+        print ("--------------------------------------------------------------------------------")
+        return action_mask
+
+    if battle.active_pokemon.must_recharge: # only problem rn
+        action_mask[10] = 1
+        #return action_mask
+
+    # available moves 6 - 9
+    if not battle.force_switch or not battle.active_pokemon.fainted:
+        for slot, move in enumerate(moves):
+            if move in available_moves:
+                action_mask[slot + move_offset] = 1
+
+    # available switches 0 - 5
     for slot, mon in enumerate(team):
         if mon in available_switches:
             action_mask[slot] = 1
     
    
-    #print (action_mask)
+    print (action_mask)
     #print (team)
     #print (moves)
     #print (battle.available_moves)
     #print (battle.available_switches)
-    #print ("--------------------------------------------------------------------------------")
+    print ("--------------------------------------------------------------------------------")
 
     return action_mask
 
@@ -243,7 +259,6 @@ def train_new(model_name, timesteps):
     train_env.close()
 
     print(f"Saved new model: {model_name}")
-
 
 
 
