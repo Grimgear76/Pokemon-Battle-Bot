@@ -40,7 +40,7 @@ from poke_env import AccountConfiguration
 from tqdm import tqdm  # pip install tqdm
 
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
-logging.getLogger("agent").setLevel(logging.CRITICAL)  # silence agent warnings too
+logging.getLogger("agent").setLevel(logging.CRITICAL)
 
 
 # -----------------------------
@@ -163,7 +163,6 @@ class CustomEnv(SinglesEnv):
                         )
                     moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
                 except AssertionError:
-                    # Skip moves that trigger poke-env assertion errors (e.g. Mirror Move) small patch can be looked into later
                     pass
 
             for i, mon in enumerate(battle.team.values()):
@@ -197,7 +196,6 @@ class CustomEnv(SinglesEnv):
             ]))
 
         except AssertionError:
-            # Return a safe zero observation if something unexpected crashes
             return np.zeros(OBS_SIZE, dtype=np.float32)
 
     def reset(self, *args, **kwargs):
@@ -271,13 +269,31 @@ def train_new(model_name, timesteps):
     print(f"[Model Saved] {model_name}")
 
 
+def train_continue(model_name, timesteps):
+    path = model_path(model_name)
+    if not path.exists():
+        print(f"Model '{model_name}' not found! Train a new model first.")
+        return
+
+    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}")
+    train_env = make_train_env()
+    model = MaskablePPO.load(path, env=train_env)
+    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), reset_num_timesteps=False)
+    model.save(path)
+
+    train_env.close()
+    print(f"[Model Saved] {model_name}")
+
+
 # -----------------------------
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "new"   # "new" | "continue" | "eval"
+    MODE = "continue"   # "new" | "continue" | "eval"
     MODEL_NAME = "LongTest"
-    training_steps = 500000
+    training_steps = 100000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
+    elif MODE == "continue":
+        train_continue(MODEL_NAME, training_steps)
