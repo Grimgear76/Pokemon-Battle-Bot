@@ -289,9 +289,9 @@ def train_continue(model_name, timesteps):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "continue"   # "new" | "continue" | "eval"
+    MODE = "new"   # "new" | "continue" | "eval"
     MODEL_NAME = "LongTest"
-    training_steps = 100000
+    training_steps = 500000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
