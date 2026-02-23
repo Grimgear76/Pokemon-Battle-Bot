@@ -345,3 +345,5 @@ if __name__ == "__main__":
         train_continue(MODEL_NAME, training_steps)
     elif MODE == "eval":
         eval_model(MODEL_NAME, n_battles=100)
+
+#For tensorboard run command in seperate terminal      tensorboard --logdir ./tensorboard_logs/
