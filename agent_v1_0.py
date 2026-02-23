@@ -67,8 +67,8 @@ class ProgressCallback(BaseCallback):
         self.episode_count = 0
 
     def _on_training_start(self):
-        actual_total = self.model._total_timesteps
-        self.pbar = tqdm(total=actual_total, desc="Training", unit="steps", dynamic_ncols=True)
+        self.pbar = tqdm(total=self.total_timesteps, desc="Training", unit="steps", dynamic_ncols=True)
+        print(f"[Training] Total timesteps this run: {self.total_timesteps:,} | Lifetime timesteps: {self.model._total_timesteps:,}")
 
     def _on_step(self) -> bool:
         self.pbar.update(1)
@@ -335,7 +335,7 @@ def eval_model(model_name, n_battles=100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "eval"       # "new" | "continue" | "eval"
+    MODE = "continue"       # "new" | "continue" | "eval"
     MODEL_NAME = "LongTest"
     training_steps = 100000
 
