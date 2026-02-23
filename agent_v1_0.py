@@ -37,7 +37,7 @@ from poke_env.environment import SingleAgentWrapper, SinglesEnv
 from poke_env.player import DefaultBattleOrder, RandomPlayer, SimpleHeuristicsPlayer
 from poke_env import AccountConfiguration
 
-from tqdm import tqdm  # pip install tqdm
+from tqdm import tqdm
 
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 logging.getLogger("agent").setLevel(logging.CRITICAL)
@@ -285,11 +285,57 @@ def train_continue(model_name, timesteps):
     print(f"[Model Saved] {model_name}")
 
 
+def eval_model(model_name, n_battles=100):
+    path = model_path(model_name)
+    if not path.exists():
+        print(f"Model '{model_name}' not found!")
+        return
+
+    print(f"[Evaluating] model={model_name}, battles={n_battles}")
+    eval_env = make_train_env()
+    model = MaskablePPO.load(path, env=eval_env)
+
+    wins, losses, draws = 0, 0, 0
+    pbar = tqdm(total=n_battles, desc="Evaluating", unit="battles")
+
+    obs, _ = eval_env.reset()
+    battles_done = 0
+
+    while battles_done < n_battles:   #Eval had some assertion issues calling already finished battles, This fixes that
+        action_masks = get_action_masks(eval_env)
+        action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+
+        try:
+            obs, reward, terminated, truncated, info = eval_env.step(action)
+        except AssertionError:
+            obs, _ = eval_env.reset()
+            continue
+
+        if terminated or truncated:
+            battle = eval_env.env.env.battle1
+            if battle is not None and battle.won is True:
+                wins += 1
+            elif battle is not None and battle.won is False:
+                losses += 1
+            else:
+                draws += 1
+            battles_done += 1
+            pbar.update(1)
+            pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
+            obs, _ = eval_env.reset()
+
+    pbar.close()
+    eval_env.close()
+
+    print(f"\n[Results] Battles: {n_battles} | Wins: {wins} | Losses: {losses} | Draws: {draws} | Win Rate: {wins/n_battles:.1%}")
+    return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / n_battles}
+
+
 # -----------------------------
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "continue"   # "new" | "continue" | "eval"
+    MODE = "eval"       # "new" | "continue" | "eval"
     MODEL_NAME = "LongTest"
     training_steps = 100000
 
@@ -297,3 +343,5 @@ if __name__ == "__main__":
         train_new(MODEL_NAME, training_steps)
     elif MODE == "continue":
         train_continue(MODEL_NAME, training_steps)
+    elif MODE == "eval":
+        eval_model(MODEL_NAME, n_battles=100)
