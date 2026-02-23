@@ -8,12 +8,12 @@ import logging
 from gymnasium.spaces import Box, Discrete
 from gymnasium import Wrapper
 
-# logging filter for random_agent
+# logging filter for Opponent_agent
 _original_get_logger = logging.getLogger
 
 def _patched_get_logger(name=None):
     logger = _original_get_logger(name)
-    if name and "random_bot" in str(name):
+    if name and "Opponent_bot" in str(name):
         logger.setLevel(logging.CRITICAL)
         logger.propagate = False
     return logger
@@ -104,6 +104,12 @@ class CustomEnv(SinglesEnv):
             name: i for i, name in enumerate(self.gen_data.pokedex.keys())
         }
 
+        # Track previous battle state for step rewards
+        self._prev_my_hp: Dict[str, float] = {}
+        self._prev_opp_hp: Dict[str, float] = {}
+        self._prev_opp_fainted: int = 0
+        self._prev_my_fainted: int = 0
+
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
             action = -2
@@ -112,7 +118,7 @@ class CustomEnv(SinglesEnv):
     @classmethod
     def create_single_agent_env(cls, config: Dict[str, Any]) -> SingleAgentWrapper:
         agent_config = AccountConfiguration("agent", None)
-        opponent_config = AccountConfiguration("random_bot", None)
+        opponent_config = AccountConfiguration("Opponent_bot", None)
 
         env = cls(
             battle_format=config["battle_format"],
@@ -126,8 +132,71 @@ class CustomEnv(SinglesEnv):
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
+    def _reset_battle_tracking(self):
+        self._prev_my_hp = {}
+        self._prev_opp_hp = {}
+        self._prev_opp_fainted = 0
+        self._prev_my_fainted = 0
+
     def calc_reward(self, battle) -> float:
-        return self.reward_computing_helper(battle, fainted_value=2.0, hp_value=1.0, victory_value=30.0)
+        reward = 0.0
+
+        # --- Win/loss/tie at battle end ---
+        if battle.finished:
+            if battle.won is None:
+                reward += -0.5  # tie
+            elif battle.won:
+                reward += 1.0
+            else:
+                reward -= 1.0
+
+            # HP differential bonus at end
+            my_hp = sum(p.current_hp_fraction for p in battle.team.values())
+            opp_hp = sum(p.current_hp_fraction for p in battle.opponent_team.values())
+            reward += 0.25 * (my_hp - opp_hp)
+
+            # Fainted penalties/bonuses at end
+            fainted_own = sum(1 for p in battle.team.values() if p.fainted)
+            fainted_enemy = sum(1 for p in battle.opponent_team.values() if p.fainted)
+            reward -= 0.05 * fainted_own
+            reward += 0.06 * fainted_enemy
+
+            self._reset_battle_tracking()
+            return reward
+
+        # --- Step rewards during battle ---
+        # Reward for new enemy faints this step
+        opp_fainted_now = sum(1 for p in battle.opponent_team.values() if p.fainted)
+        new_opp_faints = opp_fainted_now - self._prev_opp_fainted
+        if new_opp_faints > 0:
+            reward += 0.06 * new_opp_faints
+        self._prev_opp_fainted = opp_fainted_now
+
+        # Penalty for new own faints this step
+        my_fainted_now = sum(1 for p in battle.team.values() if p.fainted)
+        new_my_faints = my_fainted_now - self._prev_my_fainted
+        if new_my_faints > 0:
+            reward -= 0.05 * new_my_faints
+        self._prev_my_fainted = my_fainted_now
+
+        # Type effectiveness bonus for current move
+        if battle.active_pokemon and battle.opponent_active_pokemon:
+            for move in battle.available_moves:
+                eff = move.type.damage_multiplier(
+                    battle.opponent_active_pokemon.type_1,
+                    battle.opponent_active_pokemon.type_2,
+                    type_chart=self.gen_data.type_chart
+                )
+                if eff > 1:
+                    reward += 0.02
+                elif eff < 1:
+                    reward -= 0.01
+
+                # STAB bonus
+                if battle.active_pokemon.type_1 == move.type or battle.active_pokemon.type_2 == move.type:
+                    reward += 0.02
+
+        return reward
 
     def embed_battle(self, battle: AbstractBattle):
         try:
@@ -199,6 +268,7 @@ class CustomEnv(SinglesEnv):
             return np.zeros(OBS_SIZE, dtype=np.float32)
 
     def reset(self, *args, **kwargs):
+        self._reset_battle_tracking()
         return super().reset(*args, **kwargs)
 
     def close(self):
@@ -335,9 +405,9 @@ def eval_model(model_name, n_battles=100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "continue"   # "new" | "continue" | "eval"
-    MODEL_NAME = "LongTest"
-    training_steps = 5000
+    MODE = "new"        # "new" | "continue" | "eval"
+    MODEL_NAME = "RewardTest"
+    training_steps = 100000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
@@ -346,4 +416,4 @@ if __name__ == "__main__":
     elif MODE == "eval":
         eval_model(MODEL_NAME, n_battles=100)
 
-#For tensorboard run command in seperate terminal      tensorboard --logdir ./tensorboard_logs/
+# For tensorboard run command in separate terminal:      tensorboard --logdir ./tensorboard_logs/
