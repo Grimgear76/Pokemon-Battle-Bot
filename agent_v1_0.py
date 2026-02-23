@@ -261,8 +261,8 @@ def train_new(model_name, timesteps):
 
     print(f"[Training Started] model={model_name}, timesteps={timesteps:,}")
     train_env = make_train_env()
-    model = MaskablePPO("MlpPolicy", train_env, verbose=0)
-    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps))
+    model = MaskablePPO("MlpPolicy", train_env, verbose=0, tensorboard_log="./tensorboard_logs/")
+    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), tb_log_name=model_name)
     model.save(path)
 
     train_env.close()
@@ -277,8 +277,8 @@ def train_continue(model_name, timesteps):
 
     print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}")
     train_env = make_train_env()
-    model = MaskablePPO.load(path, env=train_env)
-    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), reset_num_timesteps=False)
+    model = MaskablePPO.load(path, env=train_env, tensorboard_log="./tensorboard_logs/")
+    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), reset_num_timesteps=False, tb_log_name=model_name)
     model.save(path)
 
     train_env.close()
@@ -301,7 +301,7 @@ def eval_model(model_name, n_battles=100):
     obs, _ = eval_env.reset()
     battles_done = 0
 
-    while battles_done < n_battles:   #Eval had some assertion issues calling already finished battles, This fixes that
+    while battles_done < n_battles:
         action_masks = get_action_masks(eval_env)
         action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
 
@@ -335,9 +335,9 @@ def eval_model(model_name, n_battles=100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "continue"       # "new" | "continue" | "eval"
+    MODE = "continue"   # "new" | "continue" | "eval"
     MODEL_NAME = "LongTest"
-    training_steps = 100000
+    training_steps = 5000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
