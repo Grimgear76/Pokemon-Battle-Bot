@@ -20,6 +20,19 @@ def _patched_get_logger(name=None):
 
 logging.getLogger = _patched_get_logger
 
+# patch poke-env Mirror Move assertion bug because lib patch stopped working
+from poke_env.battle import pokemon as _pokemon_module
+
+_original_available_moves_from_request = _pokemon_module.Pokemon.available_moves_from_request
+
+def _patched_available_moves_from_request(self, request):
+    try:
+        return _original_available_moves_from_request(self, request)
+    except (AssertionError, TypeError):
+        return []  # Returns empty list instead of None to prevent downstream errors
+
+_pokemon_module.Pokemon.available_moves_from_request = _patched_available_moves_from_request
+
 # SB3
 from stable_baselines3 import PPO, A2C, DQN, SAC
 from stable_baselines3.common.monitor import Monitor
@@ -49,8 +62,19 @@ logging.getLogger("agent").setLevel(logging.CRITICAL)
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-OBS_SIZE = 44
+OBS_SIZE = 62
 ACTION_SPACE_SIZE = 11
+
+# Status condition encoding
+STATUS_MAP = {
+    None: 0.0,
+    "brn": 0.2,
+    "frz": 0.4,
+    "par": 0.6,
+    "psn": 0.8,
+    "tox": 0.8,
+    "slp": 1.0,
+}
 
 def model_path(name) -> Path:
     return MODEL_DIR / f"{name}.zip"
@@ -105,12 +129,24 @@ class CustomEnv(SinglesEnv):
         }
 
         # Track previous battle state for step rewards
-        self._prev_my_hp: Dict[str, float] = {}
-        self._prev_opp_hp: Dict[str, float] = {}
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
+        self._last_move = None
+        self._last_active_species: Optional[str] = None
+        self._prev_best_eff: float = 1.0
 
     def action_to_order(self, action, battle, fake=False, strict=True):
+        # Track last move — clear it on switches so type reward only fires on move turns
+        if action >= 6 and action != 10 and battle is not None and battle.active_pokemon:
+            moves = list(battle.active_pokemon.moves.values())
+            move_idx = action - 6
+            if move_idx < len(moves):
+                self._last_move = moves[move_idx]
+            else:
+                self._last_move = None
+        else:
+            self._last_move = None
+
         if action == 10:
             action = -2
         return super().action_to_order(action, battle, fake=fake, strict=strict)
@@ -128,73 +164,127 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
         opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+
+
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
     def _reset_battle_tracking(self):
-        self._prev_my_hp = {}
-        self._prev_opp_hp = {}
         self._prev_opp_fainted = 0
         self._prev_my_fainted = 0
+        self._last_move = None
+        self._last_active_species = None
+        self._prev_best_eff = 1.0
 
     def calc_reward(self, battle) -> float:
         reward = 0.0
 
-        # --- Win/loss/tie at battle end ---
+        # End of battle 
         if battle.finished:
             if battle.won is None:
-                reward += -0.5  # tie
+                reward = 0.0
             elif battle.won:
-                reward += 1.0
+                reward = 2.0
             else:
-                reward -= 1.0
-
-            # HP differential bonus at end
-            my_hp = sum(p.current_hp_fraction for p in battle.team.values())
-            opp_hp = sum(p.current_hp_fraction for p in battle.opponent_team.values())
-            reward += 0.25 * (my_hp - opp_hp)
-
-            # Fainted penalties/bonuses at end
-            fainted_own = sum(1 for p in battle.team.values() if p.fainted)
-            fainted_enemy = sum(1 for p in battle.opponent_team.values() if p.fainted)
-            reward -= 0.05 * fainted_own
-            reward += 0.06 * fainted_enemy
+                reward = -2.0
 
             self._reset_battle_tracking()
             return reward
 
-        # --- Step rewards during battle ---
-        # Reward for new enemy faints this step
-        opp_fainted_now = sum(1 for p in battle.opponent_team.values() if p.fainted)
-        new_opp_faints = opp_fainted_now - self._prev_opp_fainted
-        if new_opp_faints > 0:
-            reward += 0.06 * new_opp_faints
-        self._prev_opp_fainted = opp_fainted_now
+        # Per-step faint rewards
+        opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
+        my_fainted_now = sum(p.fainted for p in battle.team.values())
 
-        # Penalty for new own faints this step
-        my_fainted_now = sum(1 for p in battle.team.values() if p.fainted)
+        new_opp_faints = opp_fainted_now - self._prev_opp_fainted
         new_my_faints = my_fainted_now - self._prev_my_fainted
-        if new_my_faints > 0:
-            reward -= 0.05 * new_my_faints
+
+        reward += 0.067 * new_opp_faints
+        reward -= 0.067 * new_my_faints
+
+        self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
 
-        # Type effectiveness bonus for current move
+        # Type effectiveness on last move used (only fires on move turns, not switches)
+        if battle.active_pokemon and battle.opponent_active_pokemon and self._last_move:
+            eff = self._last_move.type.damage_multiplier(
+                battle.opponent_active_pokemon.type_1,
+                battle.opponent_active_pokemon.type_2,
+                type_chart=self.gen_data.type_chart
+            )
+            if eff >= 2.0:      # super effective
+                reward += 0.02
+            elif eff == 0.0:    # immune, wasted turn
+                reward -= 0.015
+            elif eff < 1.0:     # not very effective
+                reward -= 0.005
+
+            # STAB — smaller bonus on top of type effectiveness
+            if self._last_move.type in [battle.active_pokemon.type_1, battle.active_pokemon.type_2]:
+                reward += 0.005
+
+        # Swap type matchup penalty 
         if battle.active_pokemon and battle.opponent_active_pokemon:
-            for move in battle.available_moves:
-                eff = move.type.damage_multiplier(
+            current_species = battle.active_pokemon.species
+
+            if self._last_active_species and current_species != self._last_active_species:
+                if battle.available_moves:
+                    new_best_eff = max(
+                        move.type.damage_multiplier(
+                            battle.opponent_active_pokemon.type_1,
+                            battle.opponent_active_pokemon.type_2,
+                            type_chart=self.gen_data.type_chart
+                        )
+                        for move in battle.available_moves
+                    )
+                    if new_best_eff < self._prev_best_eff:
+                        reward -= 0.03   # swapped to worse matchup
+                    elif new_best_eff > self._prev_best_eff:
+                        reward += 0.005  # swapped to better matchup, tiny reward not worth farming
+
+            # Store best effectiveness of current pokemon for next step
+            if battle.available_moves:
+                self._prev_best_eff = max(
+                    move.type.damage_multiplier(
+                        battle.opponent_active_pokemon.type_1,
+                        battle.opponent_active_pokemon.type_2,
+                        type_chart=self.gen_data.type_chart
+                    )
+                    for move in battle.available_moves
+                )
+            else:
+                self._prev_best_eff = 1.0
+
+            self._last_active_species = current_species
+
+        # Penalty for staying in bad matchup (fires every turn, not just on swap)
+        # Offensive penalty — best move is resisted or immune
+        if battle.active_pokemon and battle.opponent_active_pokemon and battle.available_moves:
+            best_eff = max(
+                move.type.damage_multiplier(
                     battle.opponent_active_pokemon.type_1,
                     battle.opponent_active_pokemon.type_2,
                     type_chart=self.gen_data.type_chart
                 )
-                if eff > 1:
-                    reward += 0.02
-                elif eff < 1:
-                    reward -= 0.01
+                for move in battle.available_moves
+            )
+            if best_eff == 0.0:
+                reward -= 0.02   # completely walled offensively
+            elif best_eff < 1.0:
+                reward -= 0.005  # resisted offensively
 
-                # STAB bonus
-                if battle.active_pokemon.type_1 == move.type or battle.active_pokemon.type_2 == move.type:
-                    reward += 0.02
+        # Defensive penalty — active pokemon is weak to opponent's type
+        if battle.active_pokemon and battle.opponent_active_pokemon:
+            defensive_eff = battle.opponent_active_pokemon.type_1.damage_multiplier(
+                battle.active_pokemon.type_1,
+                battle.active_pokemon.type_2,
+                type_chart=self.gen_data.type_chart
+            )
+            if defensive_eff >= 4.0:
+                reward -= 0.03   # double weakness, really should switch
+            elif defensive_eff >= 2.0:
+                reward -= 0.015  # weakness, nudge toward switching
 
         return reward
 
@@ -211,6 +301,9 @@ class CustomEnv(SinglesEnv):
             opponent_team_status = np.ones(pokemon_team, dtype=np.float32)
             self_team_status = np.ones(pokemon_team, dtype=np.float32)
             team_identifier = np.zeros(pokemon_team, dtype=np.float32)
+            opponent_identifier = np.zeros(pokemon_team, dtype=np.float32)
+            self_status = np.zeros(pokemon_team, dtype=np.float32)
+            opponent_status = np.zeros(pokemon_team, dtype=np.float32)
             special_case = np.zeros(2, dtype=np.float32)
 
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
@@ -241,11 +334,27 @@ class CustomEnv(SinglesEnv):
                 if mon.fainted:
                     opponent_team_status[i] = -1.0
 
-            species_list = list(self.gen_data.pokedex.keys())
+            # Own team species
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
                 if mon is not None and mon.species is not None:
-                    idx = species_list.index(mon.species.lower()) if mon.species.lower() in species_list else 0
-                    team_identifier[i] = (idx / (len(species_list) - 1)) * 2 - 1
+                    idx = self.species_to_id.get(mon.species.lower(), 0)
+                    team_identifier[i] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
+
+            # Opponent species — only known once revealed during battle
+            for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
+                if mon is not None and mon.species is not None:
+                    idx = self.species_to_id.get(mon.species.lower(), 0)
+                    opponent_identifier[i] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
+
+            # Own team status conditions
+            for i, mon in enumerate(battle.team.values()):
+                status_key = mon.status.value if mon.status else None
+                self_status[i] = STATUS_MAP.get(status_key, 0.0)
+
+            # Opponent status conditions
+            for i, mon in enumerate(battle.opponent_team.values()):
+                status_key = mon.status.value if mon.status else None
+                opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
 
             if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
                 special_case[0] = 1
@@ -253,16 +362,19 @@ class CustomEnv(SinglesEnv):
                 special_case[1] = 1
 
             return np.float32(np.concatenate([
-                moves_base_power,
-                moves_dmg_multiplier,
-                moves_pp_ratio,
-                self_team_status,
-                opponent_team_status,
-                team_hp_ratio,
-                opponent_hp_ratio,
-                team_identifier,
-                special_case,
-            ]))
+                moves_base_power,        # 4
+                moves_dmg_multiplier,    # 4
+                moves_pp_ratio,          # 4
+                self_team_status,        # 6
+                opponent_team_status,    # 6
+                team_hp_ratio,           # 6
+                opponent_hp_ratio,       # 6
+                team_identifier,         # 6
+                opponent_identifier,     # 6
+                self_status,             # 6
+                opponent_status,         # 6
+                special_case,            # 2
+            ]))                          # = 62 total
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -405,15 +517,15 @@ def eval_model(model_name, n_battles=100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "new"        # "new" | "continue" | "eval"
-    MODEL_NAME = "RewardTest"
-    training_steps = 100000
+    MODE = "continue"             # "new" | "continue" | "eval"
+    MODEL_NAME = "RewardTest6"
+    training_steps = 50000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
     elif MODE == "continue":
         train_continue(MODEL_NAME, training_steps)
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=100)
+        eval_model(MODEL_NAME, n_battles=200)
 
 # For tensorboard run command in separate terminal:      tensorboard --logdir ./tensorboard_logs/
