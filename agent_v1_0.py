@@ -62,7 +62,7 @@ logging.getLogger("agent").setLevel(logging.CRITICAL)
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-OBS_SIZE = 62
+OBS_SIZE = 72  # 62 original + 10 active pokemon features (5 own + 5 opponent)
 ACTION_SPACE_SIZE = 11
 
 # Status condition encoding
@@ -128,6 +128,11 @@ class CustomEnv(SinglesEnv):
             name: i for i, name in enumerate(self.gen_data.pokedex.keys())
         }
 
+        # Precompute type encoding
+        self._all_types = list(self.gen_data.type_chart.keys())
+        self._type_to_id = {t: i for i, t in enumerate(self._all_types)}
+        self._type_count = max(len(self._all_types) - 1, 1)
+
         # Track previous battle state for step rewards
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
@@ -164,9 +169,8 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
-
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
@@ -181,7 +185,7 @@ class CustomEnv(SinglesEnv):
     def calc_reward(self, battle) -> float:
         reward = 0.0
 
-        # End of battle 
+        # End of battle
         if battle.finished:
             if battle.won is None:
                 reward = 0.0
@@ -200,8 +204,8 @@ class CustomEnv(SinglesEnv):
         new_opp_faints = opp_fainted_now - self._prev_opp_fainted
         new_my_faints = my_fainted_now - self._prev_my_fainted
 
-        reward += 0.067 * new_opp_faints
-        reward -= 0.067 * new_my_faints
+        reward += 0.08 * new_opp_faints
+        reward -= 0.08 * new_my_faints
 
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
@@ -224,7 +228,7 @@ class CustomEnv(SinglesEnv):
             if self._last_move.type in [battle.active_pokemon.type_1, battle.active_pokemon.type_2]:
                 reward += 0.005
 
-        # Swap type matchup penalty 
+        # Swap type matchup penalty
         if battle.active_pokemon and battle.opponent_active_pokemon:
             current_species = battle.active_pokemon.species
 
@@ -258,8 +262,42 @@ class CustomEnv(SinglesEnv):
 
             self._last_active_species = current_species
 
-        
         return reward
+
+    def _encode_active_mon(self, mon) -> np.ndarray:
+        """
+        Encode a single active pokemon into 5 features:
+          [hp_ratio, status, species_id, type1, type2]
+        All values normalized to [-1, 1]. Returns zeros if mon is None.
+        """
+        features = np.zeros(5, dtype=np.float32)
+        if mon is None:
+            return features
+
+        # HP ratio
+        if mon.fainted or mon.max_hp == 0:
+            features[0] = -1.0
+        else:
+            features[0] = (mon.current_hp / mon.max_hp) * 2 - 1
+
+        # Status
+        status_key = mon.status.value if mon.status else None
+        features[1] = STATUS_MAP.get(status_key, 0.0)
+
+        # Species ID
+        if mon.species is not None:
+            idx = self.species_to_id.get(mon.species.lower(), 0)
+            features[2] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
+
+        # Type 1
+        if mon.type_1 is not None:
+            features[3] = (self._type_to_id.get(mon.type_1.name, 0) / self._type_count) * 2 - 1
+
+        # Type 2 (stays 0.0 if no second type)
+        if mon.type_2 is not None:
+            features[4] = (self._type_to_id.get(mon.type_2.name, 0) / self._type_count) * 2 - 1
+
+        return features
 
     def embed_battle(self, battle: AbstractBattle):
         try:
@@ -334,6 +372,10 @@ class CustomEnv(SinglesEnv):
             if battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
+            # Active pokemon explicit features: [hp, status, species_id, type1, type2]
+            active_features = self._encode_active_mon(battle.active_pokemon)           # 5
+            opp_active_features = self._encode_active_mon(battle.opponent_active_pokemon)  # 5
+
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
@@ -347,7 +389,9 @@ class CustomEnv(SinglesEnv):
                 self_status,             # 6
                 opponent_status,         # 6
                 special_case,            # 2
-            ]))                          # = 62 total
+                active_features,         # 5  [hp, status, species_id, type1, type2]
+                opp_active_features,     # 5  [hp, status, species_id, type1, type2]
+            ]))                          # = 72 total
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -491,7 +535,7 @@ def eval_model(model_name, n_battles=100):
 # -----------------------------
 if __name__ == "__main__":
     MODE = "continue"             # "new" | "continue" | "eval"
-    MODEL_NAME = "RewardTest7"
+    MODEL_NAME = "RewardTest8"
     training_steps = 100000
 
     if MODE == "new":
@@ -499,6 +543,6 @@ if __name__ == "__main__":
     elif MODE == "continue":
         train_continue(MODEL_NAME, training_steps)
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=200)
+        eval_model(MODEL_NAME, n_battles=100)
 
 # For tensorboard run command in separate terminal:      tensorboard --logdir ./tensorboard_logs/
