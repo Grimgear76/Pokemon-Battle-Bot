@@ -22,8 +22,13 @@ node pokemon-showdown start --no-security     //This runs Showdown on LocalHost
 
 
 
-//to run in venv in root     .venv .\.venv\Scripts\Activate.ps1
+//to run in venv in root     .\.venv\Scripts\Activate.ps1
 //                           python -m pip install poke-env
+//                           python -m pip install torch torchvision torchaudio
 //                           python -c "import poke_env; print(poke_env.__version__)"
+//                           pip install stable-baselines3 sb3-contrib
+//                           pip install torch gymnasium numpy
+
+
 // Run script example        python RandomPlayer.py     // Server has to be ran cd pokemon-showdown
 
