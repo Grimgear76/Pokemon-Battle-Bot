@@ -164,8 +164,8 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -186,9 +186,9 @@ class CustomEnv(SinglesEnv):
             if battle.won is None:
                 reward = 0.0
             elif battle.won:
-                reward = 2.0
+                reward = 4.0
             else:
-                reward = -2.0
+                reward = -4.0
 
             self._reset_battle_tracking()
             return reward
@@ -216,7 +216,7 @@ class CustomEnv(SinglesEnv):
             if eff >= 2.0:      # super effective
                 reward += 0.02
             elif eff == 0.0:    # immune, wasted turn
-                reward -= 0.015
+                reward -= 0.02
             elif eff < 1.0:     # not very effective
                 reward -= 0.005
 
@@ -239,9 +239,9 @@ class CustomEnv(SinglesEnv):
                         for move in battle.available_moves
                     )
                     if new_best_eff < self._prev_best_eff:
-                        reward -= 0.03   # swapped to worse matchup
+                        reward -= 0.01   # swapped to worse matchup
                     elif new_best_eff > self._prev_best_eff:
-                        reward += 0.005  # swapped to better matchup, tiny reward not worth farming
+                        reward += 0.001  # swapped to better matchup, tiny reward not worth farming
 
             # Store best effectiveness of current pokemon for next step
             if battle.available_moves:
@@ -258,34 +258,7 @@ class CustomEnv(SinglesEnv):
 
             self._last_active_species = current_species
 
-        # Penalty for staying in bad matchup (fires every turn, not just on swap)
-        # Offensive penalty — best move is resisted or immune
-        if battle.active_pokemon and battle.opponent_active_pokemon and battle.available_moves:
-            best_eff = max(
-                move.type.damage_multiplier(
-                    battle.opponent_active_pokemon.type_1,
-                    battle.opponent_active_pokemon.type_2,
-                    type_chart=self.gen_data.type_chart
-                )
-                for move in battle.available_moves
-            )
-            if best_eff == 0.0:
-                reward -= 0.02   # completely walled offensively
-            elif best_eff < 1.0:
-                reward -= 0.005  # resisted offensively
-
-        # Defensive penalty — active pokemon is weak to opponent's type
-        if battle.active_pokemon and battle.opponent_active_pokemon:
-            defensive_eff = battle.opponent_active_pokemon.type_1.damage_multiplier(
-                battle.active_pokemon.type_1,
-                battle.active_pokemon.type_2,
-                type_chart=self.gen_data.type_chart
-            )
-            if defensive_eff >= 4.0:
-                reward -= 0.03   # double weakness, really should switch
-            elif defensive_eff >= 2.0:
-                reward -= 0.015  # weakness, nudge toward switching
-
+        
         return reward
 
     def embed_battle(self, battle: AbstractBattle):
@@ -518,8 +491,8 @@ def eval_model(model_name, n_battles=100):
 # -----------------------------
 if __name__ == "__main__":
     MODE = "continue"             # "new" | "continue" | "eval"
-    MODEL_NAME = "RewardTest6"
-    training_steps = 50000
+    MODEL_NAME = "RewardTest7"
+    training_steps = 100000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
