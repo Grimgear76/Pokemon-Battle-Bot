@@ -536,7 +536,7 @@ def eval_model(model_name, n_battles=100):
 if __name__ == "__main__":
     MODE = "continue"             # "new" | "continue" | "eval".
     MODEL_NAME = "RewardTest8"
-    training_steps = 100000
+    training_steps = 50000
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps)
