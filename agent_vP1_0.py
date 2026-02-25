@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional
 from pathlib import Path
+import multiprocessing
 
 import numpy as np
 import torch
@@ -36,8 +37,9 @@ _pokemon_module.Pokemon.available_moves_from_request = _patched_available_moves_
 # SB3
 from stable_baselines3 import PPO, A2C, DQN, SAC
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
+from stable_baselines3.common.utils import set_random_seed
 
 # SB3 MaskablePPO
 from sb3_contrib import MaskablePPO
@@ -74,13 +76,28 @@ class MaxDamagePlayer(Player):
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-OBS_SIZE = 78  # 74 + 4 opponent revealed move effectiveness features
+OBS_SIZE = 78
 ACTION_SPACE_SIZE = 11
 NET_ARCH = [256, 128, 64]
-LEARNING_RATE = 0.0001
-MAX_SPEED = 140  # Electrode is fastest in gen 1
+LEARNING_RATE = 1e-4
+MAX_SPEED = 140
 
-# Status condition encoding
+# --- Parallel training config ---
+# Set N_ENVS to the number of CPU cores you want to dedicate.
+# 4–8 is a good sweet spot for most machines. Each env runs its own battle server.
+N_ENVS = 4
+
+# --- PPO Hyperparameters (anti-plateau tuned) ---
+# n_steps * N_ENVS = total rollout buffer per update.
+# 2048 * 4 envs = 8192 steps before each gradient update. Much richer signal.
+N_STEPS = 2048
+# batch_size must divide evenly into n_steps * N_ENVS
+BATCH_SIZE = 512
+N_EPOCHS = 10
+ENT_COEF = 0.02          # Slightly higher than default to fight entropy collapse
+CLIP_RANGE = 0.2
+GAE_LAMBDA = 0.95
+
 STATUS_MAP = {
     None: 0.0,
     "brn": 0.2,
@@ -99,26 +116,101 @@ def model_path(name) -> Path:
 # Progress Callback
 # -----------------------------
 class ProgressCallback(BaseCallback):
-    def __init__(self, total_timesteps, verbose=0):
+    def __init__(self, total_timesteps, n_envs=1, verbose=0):
         super().__init__(verbose)
         self.pbar = None
         self.total_timesteps = total_timesteps
+        self.n_envs = n_envs
         self.episode_count = 0
+        self.wins = 0
+        self.losses = 0
 
     def _on_training_start(self):
-        self.pbar = tqdm(total=self.total_timesteps, desc="Training", unit="steps", dynamic_ncols=True)
-        print(f"[Training] Total timesteps this run: {self.total_timesteps:,} | Lifetime timesteps: {self.model._total_timesteps:,}")
+        self.pbar = tqdm(
+            total=self.total_timesteps,
+            desc="Training",
+            unit="steps",
+            dynamic_ncols=True
+        )
+        print(
+            f"[Training] Total timesteps this run: {self.total_timesteps:,} | "
+            f"Lifetime timesteps: {self.model._total_timesteps:,} | "
+            f"n_envs={self.n_envs} | "
+            f"effective_batch={N_STEPS * self.n_envs:,}"
+        )
 
     def _on_step(self) -> bool:
-        self.pbar.update(1)
+        self.pbar.update(self.n_envs)
+
         dones = self.locals.get("dones", [])
-        if any(dones):
-            self.episode_count += sum(dones)
-            self.pbar.set_postfix(battles=self.episode_count, refresh=False)
+        infos = self.locals.get("infos", [])
+
+        for done, info in zip(dones, infos):
+            if done:
+                self.episode_count += 1
+                # SB3 Monitor wraps episode stats in info under "episode"
+                ep_info = info.get("episode", {})
+                reward = ep_info.get("r", 0)
+                if reward > 3.0:
+                    self.wins += 1
+                elif reward < -3.0:
+                    self.losses += 1
+
+        if self.episode_count > 0:
+            wr = self.wins / self.episode_count
+            self.pbar.set_postfix(
+                battles=self.episode_count,
+                W=self.wins,
+                L=self.losses,
+                WR=f"{wr:.1%}",
+                refresh=False
+            )
         return True
 
     def _on_training_end(self):
         self.pbar.close()
+
+
+# -----------------------------
+# Entropy Monitor Callback
+# (logs entropy to catch collapse early)
+# -----------------------------
+class EntropyMonitorCallback(BaseCallback):
+    """
+    Logs policy entropy every N rollouts.
+    If entropy drops below threshold, temporarily boost ent_coef.
+    This fights the plateau where the agent stops exploring.
+    """
+    ENTROPY_THRESHOLD = 0.5
+    ENT_COEF_BOOST = 0.05
+    ENT_COEF_NORMAL = ENT_COEF
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.rollout_count = 0
+        self._boosted = False
+
+    def _on_rollout_end(self):
+        self.rollout_count += 1
+        # Access entropy from logger
+        entropy = self.logger.name_to_value.get("train/entropy_loss", None)
+        if entropy is None:
+            return
+
+        # entropy_loss in SB3 is negative (maximizing entropy), so negate it
+        actual_entropy = -entropy
+
+        if actual_entropy < self.ENTROPY_THRESHOLD and not self._boosted:
+            self.model.ent_coef = self.ENT_COEF_BOOST
+            self._boosted = True
+            print(f"\n[EntropyMonitor] Entropy collapsed ({actual_entropy:.3f}). Boosting ent_coef → {self.ENT_COEF_BOOST}")
+        elif actual_entropy >= self.ENTROPY_THRESHOLD and self._boosted:
+            self.model.ent_coef = self.ENT_COEF_NORMAL
+            self._boosted = False
+            print(f"\n[EntropyMonitor] Entropy recovered ({actual_entropy:.3f}). Restoring ent_coef → {self.ENT_COEF_NORMAL}")
+
+    def _on_step(self) -> bool:
+        return True
 
 
 # -----------------------------
@@ -132,7 +224,6 @@ class CustomEnv(SinglesEnv):
             agent: Box(low=-1.0, high=1.0, shape=(OBS_SIZE,), dtype=np.float32)
             for agent in self.possible_agents
         }
-
         self.action_spaces = {
             agent: Discrete(ACTION_SPACE_SIZE)
             for agent in self.possible_agents
@@ -143,12 +234,10 @@ class CustomEnv(SinglesEnv):
             name: i for i, name in enumerate(self.gen_data.pokedex.keys())
         }
 
-        # Precompute type encoding
         self._all_types = list(self.gen_data.type_chart.keys())
         self._type_to_id = {t: i for i, t in enumerate(self._all_types)}
         self._type_count = max(len(self._all_types) - 1, 1)
 
-        # Track previous battle state for step rewards
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
         self._prev_opp_hp: float = 1.0
@@ -161,7 +250,6 @@ class CustomEnv(SinglesEnv):
         return super().action_to_order(action, battle, fake=fake, strict=strict)
 
     def _get_speed(self, mon) -> float:
-        """Return normalized speed for a pokemon using poke-env pokedex data."""
         if mon is None or mon.species is None:
             return 0.0
         try:
@@ -171,11 +259,6 @@ class CustomEnv(SinglesEnv):
             return 0.0
 
     def _get_opp_move_effectiveness(self, battle) -> np.ndarray:
-        """
-        Encode up to 4 revealed opponent moves as effectiveness against
-        our active pokemon. Returns 0.0 for unrevealed move slots.
-        Normalized to [-1, 1] by subtracting 1.0 and clipping.
-        """
         features = np.zeros(4, dtype=np.float32)
         if battle.opponent_active_pokemon is None or battle.active_pokemon is None:
             return features
@@ -195,7 +278,6 @@ class CustomEnv(SinglesEnv):
         return features
 
     def _opp_is_frozen(self, battle) -> bool:
-        """Check if opponent active pokemon is frozen."""
         if battle.opponent_active_pokemon is None:
             return False
         try:
@@ -205,9 +287,13 @@ class CustomEnv(SinglesEnv):
             return False
 
     @classmethod
-    def create_single_agent_env(cls, config: Dict[str, Any]) -> SingleAgentWrapper:
-        agent_config = AccountConfiguration("agent", None)
-        opponent_config = AccountConfiguration("Opponent_bot", None)
+    def create_single_agent_env(cls, config: Dict[str, Any], env_id: int = 0) -> SingleAgentWrapper:
+        """
+        env_id is used to give each parallel env unique account names,
+        which is required when running multiple poke-env instances simultaneously.
+        """
+        agent_config = AccountConfiguration(f"agent_{env_id}", None)
+        opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
 
         env = cls(
             battle_format=config["battle_format"],
@@ -217,8 +303,8 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        # opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
         # opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -232,7 +318,6 @@ class CustomEnv(SinglesEnv):
         self._last_active_species = None
 
     def _get_team_hp_fraction(self, team) -> float:
-        """Total current HP fraction across all pokemon on a side."""
         total_current = 0.0
         total_max = 0.0
         for mon in team.values():
@@ -246,7 +331,6 @@ class CustomEnv(SinglesEnv):
     def calc_reward(self, battle) -> float:
         reward = 0.0
 
-        # --- End of battle ---
         if battle.finished:
             if battle.won is None:
                 reward = 0.0
@@ -254,11 +338,9 @@ class CustomEnv(SinglesEnv):
                 reward = 4.0
             else:
                 reward = -4.0
-
             self._reset_battle_tracking()
             return reward
 
-        # --- Per-step faint rewards ---
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
         my_fainted_now = sum(p.fainted for p in battle.team.values())
 
@@ -271,7 +353,6 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
 
-        # --- HP delta reward (dense signal every turn) ---
         opp_hp_now = self._get_team_hp_fraction(battle.opponent_team)
         my_hp_now = self._get_team_hp_fraction(battle.team)
 
@@ -284,21 +365,17 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        # --- Freeze swap penalty ---
-        # Penalize switching when opponent is frozen to prevent swap farming
         if battle.active_pokemon is not None:
             current_species = battle.active_pokemon.species
             if (self._last_active_species is not None and
                     current_species != self._last_active_species and
                     self._opp_is_frozen(battle)):
                 reward -= 0.04
-
             self._last_active_species = current_species
 
         return reward
 
     def _encode_active_mon(self, mon) -> np.ndarray:
-        """Encode active pokemon into 5 features: [hp, status, species_id, type1, type2]"""
         features = np.zeros(5, dtype=np.float32)
         if mon is None:
             return features
@@ -398,28 +475,27 @@ class CustomEnv(SinglesEnv):
             own_speed = np.float32([self._get_speed(battle.active_pokemon)])
             opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
 
-            # Opponent revealed move effectiveness against our active pokemon
-            opp_move_eff = self._get_opp_move_effectiveness(battle)  # 4
+            opp_move_eff = self._get_opp_move_effectiveness(battle)
 
             return np.float32(np.concatenate([
-                moves_base_power,        # 4
-                moves_dmg_multiplier,    # 4
-                moves_pp_ratio,          # 4
-                self_team_status,        # 6
-                opponent_team_status,    # 6
-                team_hp_ratio,           # 6
-                opponent_hp_ratio,       # 6
-                team_identifier,         # 6
-                opponent_identifier,     # 6
-                self_status,             # 6
-                opponent_status,         # 6
-                special_case,            # 2
-                active_features,         # 5
-                opp_active_features,     # 5
-                own_speed,               # 1
-                opp_speed,               # 1
-                opp_move_eff,            # 4
-            ]))                          # = 78 total
+                moves_base_power,
+                moves_dmg_multiplier,
+                moves_pp_ratio,
+                self_team_status,
+                opponent_team_status,
+                team_hp_ratio,
+                opponent_hp_ratio,
+                team_identifier,
+                opponent_identifier,
+                self_status,
+                opponent_status,
+                special_case,
+                active_features,
+                opp_active_features,
+                own_speed,
+                opp_speed,
+                opp_move_eff,
+            ]))
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -474,45 +550,114 @@ def mask_env(env):
 
 
 # -----------------------------
+# Parallel env factory
+# -----------------------------
+def make_env_fn(env_id: int, seed: int = 0):
+    """
+    Returns a thunk (zero-argument lambda) that creates and seeds one env.
+    SubprocVecEnv calls each thunk in a separate process.
+    """
+    def _init():
+        set_random_seed(seed + env_id)
+        env = CustomEnv.create_single_agent_env(
+            {"battle_format": "gen1randombattle"},
+            env_id=env_id
+        )
+        # Wrap in Monitor so SB3 can track episode rewards/lengths
+        env = Monitor(env)
+        return env
+    return _init
+
+
+def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True):
+    """
+    Build a vectorized env. use_subproc=True runs each env in its own process
+    (true parallelism). Set use_subproc=False to debug with DummyVecEnv.
+
+    NOTE: poke-env uses asyncio internally. SubprocVecEnv isolates each env
+    in its own process/event loop, which avoids event-loop conflicts.
+    If you see asyncio errors, fall back to DummyVecEnv (use_subproc=False).
+    """
+    env_fns = [make_env_fn(env_id=i, seed=42) for i in range(n_envs)]
+    if use_subproc and n_envs > 1:
+        print(f"[VecEnv] Launching {n_envs} parallel environments (SubprocVecEnv)")
+        return SubprocVecEnv(env_fns, start_method="spawn")
+    else:
+        print(f"[VecEnv] Using DummyVecEnv with {n_envs} env(s)")
+        return DummyVecEnv(env_fns)
+
+
+# -----------------------------
+# Build model
+# -----------------------------
+def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
+    """
+    Constructs a fresh MaskablePPO with anti-plateau hyperparameters.
+
+    Key changes vs original:
+    - n_steps=2048: Collects a full rollout buffer before updating.
+      With N_ENVS=4, that's 8192 steps per update — much richer gradient signal.
+    - batch_size=512: Larger minibatches reduce gradient noise from Gen1 RNG.
+    - n_epochs=10: Reuses the collected experience 10 times (PPO's clip prevents
+      catastrophic updates). Squeezes more learning from each rollout.
+    - ent_coef=0.02: Slightly elevated to prevent premature entropy collapse
+      (the main cause of plateaus in action-masked envs).
+    - gae_lambda=0.95: Standard; good balance of bias vs variance for sparse
+      rewards like win/loss.
+    """
+    return MaskablePPO(
+        "MlpPolicy",
+        env,
+        verbose=0,
+        learning_rate=LEARNING_RATE,
+        n_steps=N_STEPS,
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
+        gamma=0.99,
+        gae_lambda=GAE_LAMBDA,
+        ent_coef=ENT_COEF,
+        clip_range=CLIP_RANGE,
+        tensorboard_log=tensorboard_log,
+        policy_kwargs=dict(net_arch=NET_ARCH)
+    )
+
+
+# -----------------------------
 # Training functions
 # -----------------------------
-def make_train_env():
-    return CustomEnv.create_single_agent_env({"battle_format": "gen1randombattle"})
-
-
-def train_new(model_name, timesteps):
+def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True):
     path = model_path(model_name)
     if path.exists():
         print(f"Model '{model_name}' already exists! Delete it or choose another name.")
         return
 
-    print(f"[Training Started] model={model_name}, timesteps={timesteps:,}")
-    train_env = make_train_env()
-    model = MaskablePPO(
-        "MlpPolicy",
-        train_env,
-        verbose=0,
-        learning_rate=LEARNING_RATE,
-        batch_size=256,
-        ent_coef=0.01,
-        gamma=0.99,
-        tensorboard_log="./tensorboard_logs/",
-        policy_kwargs=dict(net_arch=NET_ARCH)
+    print(f"[Training Started] model={model_name}, timesteps={timesteps:,}, n_envs={n_envs}")
+    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc)
+    model = build_model(train_env, model_name=model_name)
+
+    callbacks = CallbackList([
+        ProgressCallback(timesteps, n_envs=n_envs),
+        EntropyMonitorCallback(),
+    ])
+
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callbacks,
+        tb_log_name=model_name
     )
-    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), tb_log_name=model_name)
     model.save(path)
     train_env.close()
     print(f"[Model Saved] {model_name}")
 
 
-def train_continue(model_name, timesteps):
+def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found! Train a new model first.")
         return
 
-    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}")
-    train_env = make_train_env()
+    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}")
+    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc)
     model = MaskablePPO.load(
         path,
         env=train_env,
@@ -520,25 +665,35 @@ def train_continue(model_name, timesteps):
         policy_kwargs=dict(net_arch=NET_ARCH)
     )
 
-    # Force learning rate override on optimizer directly
     model.learning_rate = LEARNING_RATE
     for param_group in model.policy.optimizer.param_groups:
         param_group["lr"] = LEARNING_RATE
 
-    model.learn(total_timesteps=timesteps, callback=ProgressCallback(timesteps), reset_num_timesteps=False, tb_log_name=model_name)
+    callbacks = CallbackList([
+        ProgressCallback(timesteps, n_envs=n_envs),
+        EntropyMonitorCallback(),
+    ])
+
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callbacks,
+        reset_num_timesteps=False,
+        tb_log_name=model_name
+    )
     model.save(path)
     train_env.close()
     print(f"[Model Saved] {model_name}")
 
 
-def eval_model(model_name, n_battles=100):
+def eval_model(model_name: str, n_battles: int = 100):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found!")
         return
 
     print(f"[Evaluating] model={model_name}, battles={n_battles}")
-    eval_env = make_train_env()
+    # Always use a single env for eval — deterministic, no parallelism needed
+    eval_env = make_vec_env(n_envs=1, use_subproc=False)
     model = MaskablePPO.load(
         path,
         env=eval_env,
@@ -548,7 +703,7 @@ def eval_model(model_name, n_battles=100):
     wins, losses, draws = 0, 0, 0
     pbar = tqdm(total=n_battles, desc="Evaluating", unit="battles")
 
-    obs, _ = eval_env.reset()
+    obs = eval_env.reset()
     battles_done = 0
 
     while battles_done < n_battles:
@@ -556,23 +711,24 @@ def eval_model(model_name, n_battles=100):
         action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
 
         try:
-            obs, reward, terminated, truncated, info = eval_env.step(action)
+            obs, reward, dones, infos = eval_env.step(action)
         except AssertionError:
-            obs, _ = eval_env.reset()
+            obs = eval_env.reset()
             continue
 
-        if terminated or truncated:
-            battle = eval_env.env.env.battle1
-            if battle is not None and battle.won is True:
-                wins += 1
-            elif battle is not None and battle.won is False:
-                losses += 1
-            else:
-                draws += 1
-            battles_done += 1
-            pbar.update(1)
-            pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
-            obs, _ = eval_env.reset()
+        for i, done in enumerate(dones):
+            if done:
+                info = infos[i]
+                ep_reward = info.get("episode", {}).get("r", 0)
+                if ep_reward > 3.0:
+                    wins += 1
+                elif ep_reward < -3.0:
+                    losses += 1
+                else:
+                    draws += 1
+                battles_done += 1
+                pbar.update(1)
+                pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
 
     pbar.close()
     eval_env.close()
@@ -585,15 +741,23 @@ def eval_model(model_name, n_battles=100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    MODE = "new"             # "new" | "continue" | "eval"
-    MODEL_NAME = "RewardTest11"
+    # On macOS/Windows, multiprocessing requires this guard
+    multiprocessing.set_start_method("spawn", force=True)  # "spawn" required on Windows
+
+    MODE = "continue"             # "new" | "continue" | "eval"
+    MODEL_NAME = "ParallelTest1"
     training_steps = 500000
 
+    # N_ENVS parallel battles. Each env gets a unique account name automatically.
+    # Set use_subproc=False first to verify your env works, then flip to True.
+    N_ENVS_RUN = 4       #change 1-8  lower = less env and less cpu usage
+    USE_SUBPROC = True   #change to false if training using only 1 env
+
     if MODE == "new":
-        train_new(MODEL_NAME, training_steps)
+        train_new(MODEL_NAME, training_steps, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
     elif MODE == "continue":
-        train_continue(MODEL_NAME, training_steps)
+        train_continue(MODEL_NAME, training_steps, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
     elif MODE == "eval":
         eval_model(MODEL_NAME, n_battles=100)
 
-# For tensorboard run command in separate terminal:      tensorboard --logdir ./tensorboard_logs/
+# Tensorboard: tensorboard --logdir ./tensorboard_logs/
