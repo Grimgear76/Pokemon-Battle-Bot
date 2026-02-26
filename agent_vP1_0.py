@@ -9,13 +9,17 @@ import logging
 from gymnasium.spaces import Box, Discrete
 from gymnasium import Wrapper
 
-# logging filter for Opponent_agent
+# logging filter for Opponent_agent and noisy agent loggers
 _original_get_logger = logging.getLogger
 
 def _patched_get_logger(name=None):
     logger = _original_get_logger(name)
     if name and "Opponent_bot" in str(name):
         logger.setLevel(logging.CRITICAL)
+        logger.propagate = False
+    # Suppress bigerror countdown and Mirror Move warnings from all agent loggers
+    if name and str(name).startswith("agent"):
+        logger.setLevel(logging.ERROR)
         logger.propagate = False
     return logger
 
@@ -55,7 +59,6 @@ from poke_env import AccountConfiguration
 from tqdm import tqdm
 
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
-logging.getLogger("agent").setLevel(logging.CRITICAL)
 
 
 # -----------------------------
@@ -76,25 +79,18 @@ class MaxDamagePlayer(Player):
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-OBS_SIZE = 78
+OBS_SIZE = 79
 ACTION_SPACE_SIZE = 11
 NET_ARCH = [256, 128, 64]
 LEARNING_RATE = 1e-4
 MAX_SPEED = 140
 
 # --- Parallel training config ---
-# Set N_ENVS to the number of CPU cores you want to dedicate.
-# 4–8 is a good sweet spot for most machines. Each env runs its own battle server.
 N_ENVS = 4
-
-# --- PPO Hyperparameters (anti-plateau tuned) ---
-# n_steps * N_ENVS = total rollout buffer per update.
-# 2048 * 4 envs = 8192 steps before each gradient update. Much richer signal.
 N_STEPS = 2048
-# batch_size must divide evenly into n_steps * N_ENVS
 BATCH_SIZE = 512
 N_EPOCHS = 10
-ENT_COEF = 0.02          # Slightly higher than default to fight entropy collapse
+ENT_COEF = 0.02
 CLIP_RANGE = 0.2
 GAE_LAMBDA = 0.95
 
@@ -148,12 +144,11 @@ class ProgressCallback(BaseCallback):
         for done, info in zip(dones, infos):
             if done:
                 self.episode_count += 1
-                # SB3 Monitor wraps episode stats in info under "episode"
                 ep_info = info.get("episode", {})
                 reward = ep_info.get("r", 0)
-                if reward > 3.0:
+                if reward > 0.5:
                     self.wins += 1
-                elif reward < -3.0:
+                elif reward < -0.5:
                     self.losses += 1
 
         if self.episode_count > 0:
@@ -173,14 +168,8 @@ class ProgressCallback(BaseCallback):
 
 # -----------------------------
 # Entropy Monitor Callback
-# (logs entropy to catch collapse early)
 # -----------------------------
 class EntropyMonitorCallback(BaseCallback):
-    """
-    Logs policy entropy every N rollouts.
-    If entropy drops below threshold, temporarily boost ent_coef.
-    This fights the plateau where the agent stops exploring.
-    """
     ENTROPY_THRESHOLD = 0.5
     ENT_COEF_BOOST = 0.05
     ENT_COEF_NORMAL = ENT_COEF
@@ -192,12 +181,10 @@ class EntropyMonitorCallback(BaseCallback):
 
     def _on_rollout_end(self):
         self.rollout_count += 1
-        # Access entropy from logger
         entropy = self.logger.name_to_value.get("train/entropy_loss", None)
         if entropy is None:
             return
 
-        # entropy_loss in SB3 is negative (maximizing entropy), so negate it
         actual_entropy = -entropy
 
         if actual_entropy < self.ENTROPY_THRESHOLD and not self._boosted:
@@ -288,10 +275,6 @@ class CustomEnv(SinglesEnv):
 
     @classmethod
     def create_single_agent_env(cls, config: Dict[str, Any], env_id: int = 0) -> SingleAgentWrapper:
-        """
-        env_id is used to give each parallel env unique account names,
-        which is required when running multiple poke-env instances simultaneously.
-        """
         agent_config = AccountConfiguration(f"agent_{env_id}", None)
         opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
 
@@ -303,8 +286,8 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        # opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
         # opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -333,11 +316,11 @@ class CustomEnv(SinglesEnv):
 
         if battle.finished:
             if battle.won is None:
-                reward = 0.0
+                reward = -0.3   # draws are bad, discourage stalling to a tie
             elif battle.won:
-                reward = 4.0
+                reward = 1.0
             else:
-                reward = -4.0
+                reward = -1.0
             self._reset_battle_tracking()
             return reward
 
@@ -347,8 +330,8 @@ class CustomEnv(SinglesEnv):
         new_opp_faints = opp_fainted_now - self._prev_opp_fainted
         new_my_faints = my_fainted_now - self._prev_my_fainted
 
-        reward += 0.08 * new_opp_faints
-        reward -= 0.08 * new_my_faints
+        reward += 0.02 * new_opp_faints
+        reward -= 0.02 * new_my_faints
 
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
@@ -365,13 +348,8 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        if battle.active_pokemon is not None:
-            current_species = battle.active_pokemon.species
-            if (self._last_active_species is not None and
-                    current_species != self._last_active_species and
-                    self._opp_is_frozen(battle)):
-                reward -= 0.04
-            self._last_active_species = current_species
+        # Per-turn stall penalty — 1000 turns = -3.0, worse than a loss at -1.0
+        reward -= 0.003
 
         return reward
 
@@ -475,27 +453,30 @@ class CustomEnv(SinglesEnv):
             own_speed = np.float32([self._get_speed(battle.active_pokemon)])
             opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
 
-            opp_move_eff = self._get_opp_move_effectiveness(battle)
+            opp_move_eff = self._get_opp_move_effectiveness(battle)  # 4
+
+            opp_active_frozen = np.float32([1.0 if self._opp_is_frozen(battle) else 0.0])  # 1
 
             return np.float32(np.concatenate([
-                moves_base_power,
-                moves_dmg_multiplier,
-                moves_pp_ratio,
-                self_team_status,
-                opponent_team_status,
-                team_hp_ratio,
-                opponent_hp_ratio,
-                team_identifier,
-                opponent_identifier,
-                self_status,
-                opponent_status,
-                special_case,
-                active_features,
-                opp_active_features,
-                own_speed,
-                opp_speed,
-                opp_move_eff,
-            ]))
+                moves_base_power,        # 4
+                moves_dmg_multiplier,    # 4
+                moves_pp_ratio,          # 4
+                self_team_status,        # 6
+                opponent_team_status,    # 6
+                team_hp_ratio,           # 6
+                opponent_hp_ratio,       # 6
+                team_identifier,         # 6
+                opponent_identifier,     # 6
+                self_status,             # 6
+                opponent_status,         # 6
+                special_case,            # 2
+                active_features,         # 5
+                opp_active_features,     # 5
+                own_speed,               # 1
+                opp_speed,               # 1
+                opp_move_eff,            # 4
+                opp_active_frozen,       # 1
+            ]))                          # = 79 total
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -537,14 +518,23 @@ def mask_env(env):
         action_mask[choose_default] = 1
         return action_mask
 
+    # Check if opponent is frozen — if so, block all switches to force attacking
+    opp_frozen = (
+        battle.opponent_active_pokemon is not None and
+        battle.opponent_active_pokemon.status is not None and
+        battle.opponent_active_pokemon.status.value == "frz"
+    )
+
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
             if move in available_moves:
                 action_mask[slot + move_offset] = 1
 
-    for slot, mon in enumerate(team):
-        if mon in available_switches:
-            action_mask[slot] = 1
+    # Only allow switches if opponent is not frozen
+    if not opp_frozen:
+        for slot, mon in enumerate(team):
+            if mon in available_switches:
+                action_mask[slot] = 1
 
     return action_mask
 
@@ -553,31 +543,18 @@ def mask_env(env):
 # Parallel env factory
 # -----------------------------
 def make_env_fn(env_id: int, seed: int = 0):
-    """
-    Returns a thunk (zero-argument lambda) that creates and seeds one env.
-    SubprocVecEnv calls each thunk in a separate process.
-    """
     def _init():
         set_random_seed(seed + env_id)
         env = CustomEnv.create_single_agent_env(
             {"battle_format": "gen1randombattle"},
             env_id=env_id
         )
-        # Wrap in Monitor so SB3 can track episode rewards/lengths
         env = Monitor(env)
         return env
     return _init
 
 
 def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True):
-    """
-    Build a vectorized env. use_subproc=True runs each env in its own process
-    (true parallelism). Set use_subproc=False to debug with DummyVecEnv.
-
-    NOTE: poke-env uses asyncio internally. SubprocVecEnv isolates each env
-    in its own process/event loop, which avoids event-loop conflicts.
-    If you see asyncio errors, fall back to DummyVecEnv (use_subproc=False).
-    """
     env_fns = [make_env_fn(env_id=i, seed=42) for i in range(n_envs)]
     if use_subproc and n_envs > 1:
         print(f"[VecEnv] Launching {n_envs} parallel environments (SubprocVecEnv)")
@@ -591,20 +568,6 @@ def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True):
 # Build model
 # -----------------------------
 def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
-    """
-    Constructs a fresh MaskablePPO with anti-plateau hyperparameters.
-
-    Key changes vs original:
-    - n_steps=2048: Collects a full rollout buffer before updating.
-      With N_ENVS=4, that's 8192 steps per update — much richer gradient signal.
-    - batch_size=512: Larger minibatches reduce gradient noise from Gen1 RNG.
-    - n_epochs=10: Reuses the collected experience 10 times (PPO's clip prevents
-      catastrophic updates). Squeezes more learning from each rollout.
-    - ent_coef=0.02: Slightly elevated to prevent premature entropy collapse
-      (the main cause of plateaus in action-masked envs).
-    - gae_lambda=0.95: Standard; good balance of bias vs variance for sparse
-      rewards like win/loss.
-    """
     return MaskablePPO(
         "MlpPolicy",
         env,
@@ -692,7 +655,6 @@ def eval_model(model_name: str, n_battles: int = 100):
         return
 
     print(f"[Evaluating] model={model_name}, battles={n_battles}")
-    # Always use a single env for eval — deterministic, no parallelism needed
     eval_env = make_vec_env(n_envs=1, use_subproc=False)
     model = MaskablePPO.load(
         path,
@@ -720,9 +682,9 @@ def eval_model(model_name: str, n_battles: int = 100):
             if done:
                 info = infos[i]
                 ep_reward = info.get("episode", {}).get("r", 0)
-                if ep_reward > 3.0:
+                if ep_reward > 0.5:
                     wins += 1
-                elif ep_reward < -3.0:
+                elif ep_reward < -0.5:
                     losses += 1
                 else:
                     draws += 1
@@ -741,17 +703,14 @@ def eval_model(model_name: str, n_battles: int = 100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    # On macOS/Windows, multiprocessing requires this guard
-    multiprocessing.set_start_method("spawn", force=True)  # "spawn" required on Windows
+    multiprocessing.set_start_method("spawn", force=True)  # required on Windows
 
-    MODE = "continue"             # "new" | "continue" | "eval"
-    MODEL_NAME = "ParallelTest1"
+    MODE = "new"             # "new" | "continue" | "eval"
+    MODEL_NAME = "ParallelTest4"
     training_steps = 500000
 
-    # N_ENVS parallel battles. Each env gets a unique account name automatically.
-    # Set use_subproc=False first to verify your env works, then flip to True.
-    N_ENVS_RUN = 4       #change 1-8  lower = less env and less cpu usage
-    USE_SUBPROC = True   #change to false if training using only 1 env
+    N_ENVS_RUN = 4       # 1-8, lower = less CPU usage
+    USE_SUBPROC = True   # False if using only 1 env
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
