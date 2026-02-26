@@ -37,6 +37,22 @@ def _patched_available_moves_from_request(self, request):
 
 _pokemon_module.Pokemon.available_moves_from_request = _patched_available_moves_from_request
 
+# Monkey-patch poke-env order_to_action infinite recursion bug
+# Triggered by moves like Sky Attack that aren't in the available moves list,
+# causing order_to_action to call itself recursively until stack overflow.
+from poke_env.environment import singles_env as _singles_env_module
+
+_original_order_to_action = _singles_env_module.SinglesEnv.order_to_action
+
+def _patched_order_to_action(self, order, battle, fake=False):
+    try:
+        return _original_order_to_action(self, order, battle, fake=fake)
+    except (ValueError, RecursionError):
+        # Fall back to default action (choose_default = -2) when move not found
+        return 10
+
+_singles_env_module.SinglesEnv.order_to_action = _patched_order_to_action
+
 # SB3
 from stable_baselines3 import PPO, A2C, DQN, SAC
 from stable_baselines3.common.monitor import Monitor
@@ -62,8 +78,7 @@ logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 
 
 # -----------------------------
-# Frozen status helper
-# Robust check that works regardless of whether .value is int or str
+# Status helpers
 # -----------------------------
 def _is_frozen(mon) -> bool:
     """Return True if the pokemon is frozen, using a robust multi-method check."""
@@ -73,14 +88,30 @@ def _is_frozen(mon) -> bool:
         status = mon.status
         if status is None:
             return False
-        # Method 1: compare against the enum member directly
         if status == PokemonStatus.FRZ:
             return True
-        # Method 2: .name is always the string key ("FRZ")
         if hasattr(status, "name") and status.name == "FRZ":
             return True
-        # Method 3: .value might be the string "frz" on some versions
         if hasattr(status, "value") and str(status.value).lower() == "frz":
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_paralyzed(mon) -> bool:
+    """Return True if the pokemon is paralyzed, using a robust multi-method check."""
+    if mon is None:
+        return False
+    try:
+        status = mon.status
+        if status is None:
+            return False
+        if status == PokemonStatus.PAR:
+            return True
+        if hasattr(status, "name") and status.name == "PAR":
+            return True
+        if hasattr(status, "value") and str(status.value).lower() == "par":
             return True
     except Exception:
         pass
@@ -105,7 +136,7 @@ class MaxDamagePlayer(Player):
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-OBS_SIZE = 79
+OBS_SIZE = 82
 ACTION_SPACE_SIZE = 11
 NET_ARCH = [256, 128, 64]
 LEARNING_RATE = 1e-4
@@ -256,8 +287,10 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
         self._last_active_species: Optional[str] = None
-        self._consec_switches_while_frozen: int = 0  # escalating penalty counter
-        self._consec_wasted_moves: int = 0           # escalating penalty for spamming ineffective moves
+        self._consec_frozen_wasted: int = 0   # turns wasted vs frozen opponent (switch OR bad move)
+        self._consec_wasted_moves: int = 0    # turns where nothing happened at all
+        self._frozen_opp_species: Optional[str] = None  # tracks which frozen opp we're stalling on
+        self._frozen_opp_last_hp: float = 1.0           # HP of frozen opp last turn
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -272,6 +305,24 @@ class CustomEnv(SinglesEnv):
             return (speed / MAX_SPEED) * 2 - 1
         except (KeyError, TypeError):
             return 0.0
+
+    def _get_type_advantage(self, attacker, defender) -> float:
+        """Returns the best damage multiplier any of attacker's moves has vs defender."""
+        if attacker is None or defender is None:
+            return 1.0
+        best = 1.0
+        for move in attacker.moves.values():
+            try:
+                mult = move.type.damage_multiplier(
+                    defender.type_1,
+                    defender.type_2,
+                    type_chart=self.gen_data.type_chart
+                )
+                if mult > best:
+                    best = mult
+            except Exception:
+                pass
+        return best
 
     def _get_opp_move_effectiveness(self, battle) -> np.ndarray:
         features = np.zeros(4, dtype=np.float32)
@@ -318,8 +369,10 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = 1.0
         self._prev_my_hp = 1.0
         self._last_active_species = None
-        self._consec_switches_while_frozen = 0
+        self._consec_frozen_wasted = 0
         self._consec_wasted_moves = 0
+        self._frozen_opp_species = None
+        self._frozen_opp_last_hp = 1.0
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -372,36 +425,55 @@ class CustomEnv(SinglesEnv):
         # Per-turn stall penalty
         reward -= 0.001
 
-        # Escalating penalty for consecutive switches while opponent is frozen.
-        # If the agent switches on a frozen opponent, the penalty compounds each
-        # consecutive turn it refuses to attack: -0.02, -0.04, -0.08, -0.16 ...
-        # Attacking resets the counter and grants a bonus instead.
-        if _is_frozen(battle.opponent_active_pokemon):
-            if opp_hp_lost > 0:
-                # Attacked the frozen opponent — reward and reset streak
-                reward += 0.05 * opp_hp_lost * 100
-                self._consec_switches_while_frozen = 0
-            else:
-                # Wasted the turn (switched or used a non-damaging move)
-                self._consec_switches_while_frozen += 1
-                penalty = 0.01 * (2 ** (self._consec_switches_while_frozen - 1))
-                penalty = min(penalty, 1.0)  # cap at 1.0 to avoid runaway values
-                reward -= penalty
-        else:
-            # Opponent is no longer frozen — reset counter
-            self._consec_switches_while_frozen = 0
+        # Escalating penalty for consecutive wasted turns while opponent is frozen.
+        # Uses the frozen pokemon's own HP rather than opp_hp_lost, because
+        # opp_hp_lost can appear as zero on switch turns even when damage was dealt
+        # the previous turn. Counter is tied to the specific frozen pokemon so it
+        # persists across switches and cannot be reset by rotating party members.
+        opp_active = battle.opponent_active_pokemon
+        if _is_frozen(opp_active):
+            current_species = opp_active.species if opp_active else None
+            current_hp = (opp_active.current_hp / opp_active.max_hp) if (opp_active and opp_active.max_hp > 0) else 0.0
 
-        # Escalating penalty for repeatedly using moves that deal no damage
-        # (e.g. spamming Thunder Wave on a frozen pokemon, or status moves into
-        # an immune target). Resets as soon as any HP damage is dealt.
-        if opp_hp_lost > 0:
+            if current_species != self._frozen_opp_species:
+                # New frozen target — reset and start tracking
+                self._frozen_opp_species = current_species
+                self._frozen_opp_last_hp = current_hp
+                self._consec_frozen_wasted = 0
+            else:
+                hp_dealt = self._frozen_opp_last_hp - current_hp
+                if hp_dealt > 0:
+                    # Dealt damage this turn — reward and reset
+                    reward += 0.05 * hp_dealt * 100
+                    self._consec_frozen_wasted = 0
+                else:
+                    # No damage dealt — escalate penalty
+                    self._consec_frozen_wasted += 1
+                    penalty = 0.01 * (2 ** (self._consec_frozen_wasted - 1))
+                    penalty = min(penalty, 1.0)
+                    reward -= penalty
+                self._frozen_opp_last_hp = current_hp
+        else:
+            # Opponent not frozen — clear tracker
+            self._frozen_opp_species = None
+            self._consec_frozen_wasted = 0
+
+        # Escalating penalty for repeatedly doing nothing useful —
+        # no HP change on either side and no force switch (e.g. failed status moves,
+        # maxed stat boosts, spamming Thunder Wave on paralyzed target).
+        # Grace period of 3 turns before any penalty kicks in, and growth is
+        # linear rather than exponential to avoid overwhelming early training.
+        opp_hp_actually_dropped = (self._prev_opp_hp - opp_hp_now) > 0.001
+        my_hp_actually_dropped = (self._prev_my_hp - my_hp_now) > 0.001
+
+        if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
-        elif my_hp_lost == 0 and not battle.force_switch:
-            # Turn passed, no HP changed on either side — likely a failed/wasted move
+        elif not my_hp_actually_dropped and not battle.force_switch:
             self._consec_wasted_moves += 1
-            penalty = 0.01 * (2 ** (self._consec_wasted_moves - 1))
-            penalty = min(penalty, 0.5)  # softer cap than frozen stall
-            reward -= penalty
+            if self._consec_wasted_moves > 3:  # 3-turn grace period
+                penalty = 0.005 * (self._consec_wasted_moves - 3)
+                penalty = min(penalty, 0.2)    # soft cap
+                reward -= penalty
         else:
             self._consec_wasted_moves = 0
 
@@ -509,7 +581,18 @@ class CustomEnv(SinglesEnv):
 
             opp_move_eff = self._get_opp_move_effectiveness(battle)  # 4
 
-            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])  # 1
+            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])       # 1
+            opp_active_paralyzed = np.float32([1.0 if _is_paralyzed(battle.opponent_active_pokemon) else 0.0]) # 1
+
+            # Stat boosts normalized -6..+6 → -1..1 so agent knows when buffs are maxed
+            own_atk_boost = np.float32([
+                battle.active_pokemon.boosts.get("atk", 0) / 6.0
+                if battle.active_pokemon else 0.0
+            ])  # 1
+            own_spe_boost = np.float32([
+                battle.active_pokemon.boosts.get("spa", 0) / 6.0
+                if battle.active_pokemon else 0.0
+            ])  # 1
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
@@ -530,7 +613,10 @@ class CustomEnv(SinglesEnv):
                 opp_speed,               # 1
                 opp_move_eff,            # 4
                 opp_active_frozen,       # 1
-            ]))                          # = 79 total
+                opp_active_paralyzed,    # 1
+                own_atk_boost,           # 1
+                own_spe_boost,           # 1
+            ]))                          # = 82 total
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -574,25 +660,18 @@ def mask_env(env):
         action_mask[choose_default] = 1
         return action_mask
 
-    # Use the robust helper — this is the critical fix
-    opp_frozen = _is_frozen(battle.opponent_active_pokemon)
-
     # Enable move actions
-    has_moves_available = False
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
             if move in available_moves:
                 action_mask[slot + move_offset] = 1
-                has_moves_available = True
 
-    # Only allow switches when opponent is NOT frozen
-    if not opp_frozen:
-        for slot, mon in enumerate(team):
-            if mon in available_switches:
-                action_mask[slot] = 1
+    # Enable all valid switches — reward shaping handles frozen opponent stalling
+    for slot, mon in enumerate(team):
+        if mon in available_switches:
+            action_mask[slot] = 1
 
-    # choose_default is only ever a last resort — never allowed when moves exist
-    # (also blocks the stall loophole when opponent is frozen and moves are available)
+    # choose_default only as absolute last resort
     if not any(action_mask):
         action_mask[choose_default] = 1
 
@@ -766,10 +845,10 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)  # required on Windows
 
     MODE = "new"             # "new" | "continue" | "eval"
-    MODEL_NAME = "ParallelTest6"
+    MODEL_NAME = "ParallelTest8"
     training_steps = 500000
 
-    N_ENVS_RUN = 4       # 1-8, lower = less CPU usage
+    N_ENVS_RUN = 5       # 1-8, lower = less CPU usage
     USE_SUBPROC = True   # False if using only 1 env
 
     if MODE == "new":
