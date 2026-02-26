@@ -49,7 +49,7 @@ def _patched_order_to_action(self, order, battle, **kwargs):
     fake = kwargs.pop("fake", False)
     try:
         return _original_order_to_action(self, order, battle, fake)
-    except (ValueError, RecursionError, AssertionError):  
+    except (ValueError, RecursionError, AssertionError):
         return 10
 
 _singles_env_module.SinglesEnv.order_to_action = _patched_order_to_action
@@ -290,8 +290,9 @@ class CustomEnv(SinglesEnv):
         self._last_active_species: Optional[str] = None
         self._consec_frozen_wasted: int = 0   # turns wasted vs frozen opponent (switch OR bad move)
         self._consec_wasted_moves: int = 0    # turns where nothing happened at all
-        self._frozen_opp_species: Optional[str] = None  # tracks which frozen opp we're stalling on
-        self._frozen_opp_last_hp: float = 1.0           # HP of frozen opp last turn
+        self._frozen_opp_species: Optional[str] = None  # active frozen mon being tracked
+        self._frozen_opp_last_hp: float = 1.0           # HP of active frozen mon last turn
+        self._frozen_mons: set = set()                  # species of ALL currently frozen opponent mons
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -374,6 +375,7 @@ class CustomEnv(SinglesEnv):
         self._consec_wasted_moves = 0
         self._frozen_opp_species = None
         self._frozen_opp_last_hp = 1.0
+        self._frozen_mons = set()
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -423,47 +425,64 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        # Per-turn stall penalty
+        # Per-turn stall penalty up to -1.0 after max 1000 turns
         reward -= 0.001
 
-        # Escalating penalty for consecutive wasted turns while opponent is frozen.
-        # Uses the frozen pokemon's own HP rather than opp_hp_lost, because
-        # opp_hp_lost can appear as zero on switch turns even when damage was dealt
-        # the previous turn. Counter is tied to the specific frozen pokemon so it
-        # persists across switches and cannot be reset by rotating party members.
-        opp_active = battle.opponent_active_pokemon
-        if _is_frozen(opp_active):
-            current_species = opp_active.species if opp_active else None
-            current_hp = (opp_active.current_hp / opp_active.max_hp) if (opp_active and opp_active.max_hp > 0) else 0.0
+        # --- Frozen opponent tracking ---
+        # Maintain registry of ALL frozen opponent mons across the whole battle.
+        # This persists across switches so the penalty counter cannot be reset by
+        # rotating party members — switching away from a frozen mon is just as bad
+        # as attacking it ineffectively.
+        for mon in battle.opponent_team.values():
+            if _is_frozen(mon):
+                self._frozen_mons.add(mon.species)
+            elif mon.species in self._frozen_mons and not _is_frozen(mon):
+                # Mon thawed naturally or fainted — remove from registry
+                self._frozen_mons.discard(mon.species)
 
-            if current_species != self._frozen_opp_species:
-                # New frozen target — reset and start tracking
-                self._frozen_opp_species = current_species
-                self._frozen_opp_last_hp = current_hp
-                self._consec_frozen_wasted = 0
-            else:
-                hp_dealt = self._frozen_opp_last_hp - current_hp
-                if hp_dealt > 0:
-                    # Dealt damage this turn — reward and reset
-                    reward += 0.05 * hp_dealt * 100
-                    self._consec_frozen_wasted = 0
+        opp_active = battle.opponent_active_pokemon
+
+        if self._frozen_mons:
+            if opp_active and opp_active.species in self._frozen_mons:
+                # Frozen mon is active — check if we dealt damage this turn
+                current_hp = (opp_active.current_hp / opp_active.max_hp) if opp_active.max_hp > 0 else 0.0
+
+                if opp_active.species != self._frozen_opp_species:
+                    # Switched back to frozen target — reset HP baseline but carry
+                    # the wasted-turn counter forward so switching can't game the penalty
+                    self._frozen_opp_species = opp_active.species
+                    self._frozen_opp_last_hp = current_hp
                 else:
-                    # No damage dealt — escalate penalty
-                    self._consec_frozen_wasted += 1
-                    penalty = 0.01 * (2 ** (self._consec_frozen_wasted - 1))
-                    penalty = min(penalty, 1.0)
-                    reward -= penalty
-                self._frozen_opp_last_hp = current_hp
+                    hp_dealt = self._frozen_opp_last_hp - current_hp
+                    if hp_dealt > 0:
+                        # Dealt damage — reward and reset counter
+                        reward += 0.05 * hp_dealt * 100
+                        self._consec_frozen_wasted = 0
+                    else:
+                        # No damage dealt while frozen mon is active — escalate  3 turn grace period
+                        self._consec_frozen_wasted += 1
+                        if self._consec_frozen_wasted > 3:
+                            penalty = 0.02 * (self._consec_frozen_wasted - 2)
+                            reward -= min(penalty, 0.5)
+                    self._frozen_opp_last_hp = current_hp
+            else:
+                # Frozen mon exists but agent switched it to the bench — penalize
+                # every turn we're not finishing it, counter keeps accumulating
+                self._consec_frozen_wasted += 1
+                penalty = 0.02 * self._consec_frozen_wasted
+                reward -= min(penalty, 0.5)
+                # Clear active tracker so HP baseline resets correctly when we switch back
+                self._frozen_opp_species = None
         else:
-            # Opponent not frozen — clear tracker
+            # No frozen mons on opponent's team — clear all tracking
             self._frozen_opp_species = None
             self._consec_frozen_wasted = 0
 
-        # Escalating penalty for repeatedly doing nothing useful —
+        # --- Wasted move penalty ---
+        # Escalating penalty for repeatedly doing nothing useful:
         # no HP change on either side and no force switch (e.g. failed status moves,
         # maxed stat boosts, spamming Thunder Wave on paralyzed target).
-        # Grace period of 3 turns before any penalty kicks in, and growth is
-        # linear rather than exponential to avoid overwhelming early training.
+        # Grace period of 3 turns before any penalty kicks in.
         opp_hp_actually_dropped = (self._prev_opp_hp - opp_hp_now) > 0.001
         my_hp_actually_dropped = (self._prev_my_hp - my_hp_now) > 0.001
 
@@ -849,7 +868,7 @@ if __name__ == "__main__":
     MODEL_NAME = "ParallelTest8"
     training_steps = 500000
 
-    N_ENVS_RUN = 5       # 1-8, lower = less CPU usage
+    N_ENVS_RUN = 6       # 1-8, lower = less CPU usage
     USE_SUBPROC = True   # False if using only 1 env
 
     if MODE == "new":
@@ -861,5 +880,5 @@ if __name__ == "__main__":
 
 # Tensorboard command: tensorboard --logdir ./tensorboard_logs/
 
-# if running on newer python version that doesnt support tensorboard yet 
+# if running on newer python version that doesnt support tensorboard yet
 # .venv311\Scripts\python.exe -m tensorboard.main --logdir ./tensorboard_logs/
