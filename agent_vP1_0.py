@@ -17,7 +17,6 @@ def _patched_get_logger(name=None):
     if name and "Opponent_bot" in str(name):
         logger.setLevel(logging.CRITICAL)
         logger.propagate = False
-    # Suppress bigerror countdown and Mirror Move warnings from all agent loggers
     if name and str(name).startswith("agent"):
         logger.setLevel(logging.ERROR)
         logger.propagate = False
@@ -51,6 +50,7 @@ from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
 
 from poke_env.battle import AbstractBattle, Battle
+from poke_env.battle.status import Status as PokemonStatus
 from poke_env.data import GenData
 from poke_env.environment import SingleAgentWrapper, SinglesEnv
 from poke_env.player import DefaultBattleOrder, RandomPlayer, SimpleHeuristicsPlayer, Player
@@ -59,6 +59,32 @@ from poke_env import AccountConfiguration
 from tqdm import tqdm
 
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
+
+
+# -----------------------------
+# Frozen status helper
+# Robust check that works regardless of whether .value is int or str
+# -----------------------------
+def _is_frozen(mon) -> bool:
+    """Return True if the pokemon is frozen, using a robust multi-method check."""
+    if mon is None:
+        return False
+    try:
+        status = mon.status
+        if status is None:
+            return False
+        # Method 1: compare against the enum member directly
+        if status == PokemonStatus.FRZ:
+            return True
+        # Method 2: .name is always the string key ("FRZ")
+        if hasattr(status, "name") and status.name == "FRZ":
+            return True
+        # Method 3: .value might be the string "frz" on some versions
+        if hasattr(status, "value") and str(status.value).lower() == "frz":
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # -----------------------------
@@ -230,6 +256,8 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
         self._last_active_species: Optional[str] = None
+        self._consec_switches_while_frozen: int = 0  # escalating penalty counter
+        self._consec_wasted_moves: int = 0           # escalating penalty for spamming ineffective moves
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -264,15 +292,6 @@ class CustomEnv(SinglesEnv):
 
         return features
 
-    def _opp_is_frozen(self, battle) -> bool:
-        if battle.opponent_active_pokemon is None:
-            return False
-        try:
-            status = battle.opponent_active_pokemon.status
-            return status is not None and status.value == "frz"
-        except Exception:
-            return False
-
     @classmethod
     def create_single_agent_env(cls, config: Dict[str, Any], env_id: int = 0) -> SingleAgentWrapper:
         agent_config = AccountConfiguration(f"agent_{env_id}", None)
@@ -299,6 +318,8 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = 1.0
         self._prev_my_hp = 1.0
         self._last_active_species = None
+        self._consec_switches_while_frozen = 0
+        self._consec_wasted_moves = 0
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -316,7 +337,7 @@ class CustomEnv(SinglesEnv):
 
         if battle.finished:
             if battle.won is None:
-                reward = -0.3   # draws are bad, discourage stalling to a tie
+                reward = -0.3
             elif battle.won:
                 reward = 1.0
             else:
@@ -348,8 +369,41 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        # Per-turn stall penalty — 1000 turns = -3.0, worse than a loss at -1.0
-        reward -= 0.003
+        # Per-turn stall penalty
+        reward -= 0.001
+
+        # Escalating penalty for consecutive switches while opponent is frozen.
+        # If the agent switches on a frozen opponent, the penalty compounds each
+        # consecutive turn it refuses to attack: -0.02, -0.04, -0.08, -0.16 ...
+        # Attacking resets the counter and grants a bonus instead.
+        if _is_frozen(battle.opponent_active_pokemon):
+            if opp_hp_lost > 0:
+                # Attacked the frozen opponent — reward and reset streak
+                reward += 0.05 * opp_hp_lost * 100
+                self._consec_switches_while_frozen = 0
+            else:
+                # Wasted the turn (switched or used a non-damaging move)
+                self._consec_switches_while_frozen += 1
+                penalty = 0.01 * (2 ** (self._consec_switches_while_frozen - 1))
+                penalty = min(penalty, 1.0)  # cap at 1.0 to avoid runaway values
+                reward -= penalty
+        else:
+            # Opponent is no longer frozen — reset counter
+            self._consec_switches_while_frozen = 0
+
+        # Escalating penalty for repeatedly using moves that deal no damage
+        # (e.g. spamming Thunder Wave on a frozen pokemon, or status moves into
+        # an immune target). Resets as soon as any HP damage is dealt.
+        if opp_hp_lost > 0:
+            self._consec_wasted_moves = 0
+        elif my_hp_lost == 0 and not battle.force_switch:
+            # Turn passed, no HP changed on either side — likely a failed/wasted move
+            self._consec_wasted_moves += 1
+            penalty = 0.01 * (2 ** (self._consec_wasted_moves - 1))
+            penalty = min(penalty, 0.5)  # softer cap than frozen stall
+            reward -= penalty
+        else:
+            self._consec_wasted_moves = 0
 
         return reward
 
@@ -455,7 +509,7 @@ class CustomEnv(SinglesEnv):
 
             opp_move_eff = self._get_opp_move_effectiveness(battle)  # 4
 
-            opp_active_frozen = np.float32([1.0 if self._opp_is_frozen(battle) else 0.0])  # 1
+            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])  # 1
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
@@ -510,31 +564,37 @@ def mask_env(env):
     move_offset = 6
     choose_default = 10
 
+    # Truly no options at all — must use default
     if len(available_moves) == 0 and len(available_switches) == 0:
         action_mask[choose_default] = 1
         return action_mask
 
+    # Must recharge — must use default
     if battle.active_pokemon.must_recharge:
         action_mask[choose_default] = 1
         return action_mask
 
-    # Check if opponent is frozen — if so, block all switches to force attacking
-    opp_frozen = (
-        battle.opponent_active_pokemon is not None and
-        battle.opponent_active_pokemon.status is not None and
-        battle.opponent_active_pokemon.status.value == "frz"
-    )
+    # Use the robust helper — this is the critical fix
+    opp_frozen = _is_frozen(battle.opponent_active_pokemon)
 
+    # Enable move actions
+    has_moves_available = False
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
             if move in available_moves:
                 action_mask[slot + move_offset] = 1
+                has_moves_available = True
 
-    # Only allow switches if opponent is not frozen
+    # Only allow switches when opponent is NOT frozen
     if not opp_frozen:
         for slot, mon in enumerate(team):
             if mon in available_switches:
                 action_mask[slot] = 1
+
+    # choose_default is only ever a last resort — never allowed when moves exist
+    # (also blocks the stall loophole when opponent is frozen and moves are available)
+    if not any(action_mask):
+        action_mask[choose_default] = 1
 
     return action_mask
 
@@ -706,7 +766,7 @@ if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)  # required on Windows
 
     MODE = "new"             # "new" | "continue" | "eval"
-    MODEL_NAME = "ParallelTest4"
+    MODEL_NAME = "ParallelTest6"
     training_steps = 500000
 
     N_ENVS_RUN = 4       # 1-8, lower = less CPU usage
