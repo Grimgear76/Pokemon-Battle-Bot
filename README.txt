@@ -28,6 +28,9 @@ node pokemon-showdown start --no-security     //This runs Showdown on LocalHost
 //                           python -c "import poke_env; print(poke_env.__version__)"
 //                           pip install stable-baselines3 sb3-contrib
 //                           pip install torch gymnasium numpy
+//                           python -m pip install --upgrade pip setuptools
+//                           pip install tensorboard
+//                           pip install tqdm
 
 
 // Run script example        python RandomPlayer.py     // Server has to be ran cd pokemon-showdown

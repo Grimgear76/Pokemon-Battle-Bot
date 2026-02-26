@@ -44,11 +44,12 @@ from poke_env.environment import singles_env as _singles_env_module
 
 _original_order_to_action = _singles_env_module.SinglesEnv.order_to_action
 
-def _patched_order_to_action(self, order, battle, fake=False):
+def _patched_order_to_action(self, order, battle, **kwargs):
+    kwargs.pop("strict", None)
+    fake = kwargs.pop("fake", False)
     try:
-        return _original_order_to_action(self, order, battle, fake=fake)
-    except (ValueError, RecursionError):
-        # Fall back to default action (choose_default = -2) when move not found
+        return _original_order_to_action(self, order, battle, fake)
+    except (ValueError, RecursionError, AssertionError):  
         return 10
 
 _singles_env_module.SinglesEnv.order_to_action = _patched_order_to_action
@@ -472,7 +473,7 @@ class CustomEnv(SinglesEnv):
             self._consec_wasted_moves += 1
             if self._consec_wasted_moves > 3:  # 3-turn grace period
                 penalty = 0.005 * (self._consec_wasted_moves - 3)
-                penalty = min(penalty, 0.2)    # soft cap
+                penalty = min(penalty, 0.3)    # soft cap
                 reward -= penalty
         else:
             self._consec_wasted_moves = 0
@@ -858,4 +859,7 @@ if __name__ == "__main__":
     elif MODE == "eval":
         eval_model(MODEL_NAME, n_battles=100)
 
-# Tensorboard: tensorboard --logdir ./tensorboard_logs/
+# Tensorboard command: tensorboard --logdir ./tensorboard_logs/
+
+# if running on newer python version that doesnt support tensorboard yet 
+# .venv311\Scripts\python.exe -m tensorboard.main --logdir ./tensorboard_logs/
