@@ -38,8 +38,6 @@ def _patched_available_moves_from_request(self, request):
 _pokemon_module.Pokemon.available_moves_from_request = _patched_available_moves_from_request
 
 # Monkey-patch poke-env order_to_action infinite recursion bug
-# Triggered by moves like Sky Attack that aren't in the available moves list,
-# causing order_to_action to call itself recursively until stack overflow.
 from poke_env.environment import singles_env as _singles_env_module
 
 _original_order_to_action = _singles_env_module.SinglesEnv.order_to_action
@@ -82,7 +80,6 @@ logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 # Status helpers
 # -----------------------------
 def _is_frozen(mon) -> bool:
-    """Return True if the pokemon is frozen, using a robust multi-method check."""
     if mon is None:
         return False
     try:
@@ -101,7 +98,6 @@ def _is_frozen(mon) -> bool:
 
 
 def _is_paralyzed(mon) -> bool:
-    """Return True if the pokemon is paralyzed, using a robust multi-method check."""
     if mon is None:
         return False
     try:
@@ -288,11 +284,11 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
         self._last_active_species: Optional[str] = None
-        self._consec_frozen_wasted: int = 0   # turns wasted vs frozen opponent (switch OR bad move)
-        self._consec_wasted_moves: int = 0    # turns where nothing happened at all
-        self._frozen_opp_species: Optional[str] = None  # active frozen mon being tracked
-        self._frozen_opp_last_hp: float = 1.0           # HP of active frozen mon last turn
-        self._frozen_mons: set = set()                  # species of ALL currently frozen opponent mons
+        self._consec_frozen_wasted: int = 0
+        self._consec_wasted_moves: int = 0
+        self._frozen_opp_species: Optional[str] = None
+        self._frozen_opp_last_hp: float = 1.0
+        self._frozen_mons: set = set()
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -309,7 +305,6 @@ class CustomEnv(SinglesEnv):
             return 0.0
 
     def _get_type_advantage(self, attacker, defender) -> float:
-        """Returns the best damage multiplier any of attacker's moves has vs defender."""
         if attacker is None or defender is None:
             return 1.0
         best = 1.0
@@ -358,9 +353,9 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        # opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        # opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)          ----------------------------------------------------------(For easier finding)
+        #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
@@ -401,6 +396,7 @@ class CustomEnv(SinglesEnv):
             self._reset_battle_tracking()
             return reward
 
+        # --- Faint tracking ---
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
         my_fainted_now = sum(p.fainted for p in battle.team.values())
 
@@ -413,11 +409,15 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
 
+        # --- HP tracking — capture old values BEFORE updating ---
+        old_opp_hp = self._prev_opp_hp
+        old_my_hp = self._prev_my_hp
+
         opp_hp_now = self._get_team_hp_fraction(battle.opponent_team)
         my_hp_now = self._get_team_hp_fraction(battle.team)
 
-        opp_hp_lost = self._prev_opp_hp - opp_hp_now
-        my_hp_lost = self._prev_my_hp - my_hp_now
+        opp_hp_lost = old_opp_hp - opp_hp_now
+        my_hp_lost = old_my_hp - my_hp_now
 
         reward += 0.002 * max(opp_hp_lost, 0) * 100
         reward -= 0.002 * max(my_hp_lost, 0) * 100
@@ -425,75 +425,63 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        # Per-turn stall penalty up to -1.0 after max 1000 turns
+        # Per-turn stall penalty
         reward -= 0.001
 
         # --- Frozen opponent tracking ---
-        # Maintain registry of ALL frozen opponent mons across the whole battle.
-        # This persists across switches so the penalty counter cannot be reset by
-        # rotating party members — switching away from a frozen mon is just as bad
-        # as attacking it ineffectively.
         for mon in battle.opponent_team.values():
             if _is_frozen(mon):
                 self._frozen_mons.add(mon.species)
             elif mon.species in self._frozen_mons and not _is_frozen(mon):
-                # Mon thawed naturally or fainted — remove from registry
                 self._frozen_mons.discard(mon.species)
 
         opp_active = battle.opponent_active_pokemon
 
         if self._frozen_mons:
             if opp_active and opp_active.species in self._frozen_mons:
-                # Frozen mon is active — check if we dealt damage this turn
                 current_hp = (opp_active.current_hp / opp_active.max_hp) if opp_active.max_hp > 0 else 0.0
 
                 if opp_active.species != self._frozen_opp_species:
-                    # Switched back to frozen target — reset HP baseline but carry
-                    # the wasted-turn counter forward so switching can't game the penalty
+                    # Switched back to frozen target — record species but don't
+                    # reset HP baseline; only initialise it if genuinely unset
                     self._frozen_opp_species = opp_active.species
-                    self._frozen_opp_last_hp = current_hp
+                    if self._frozen_opp_last_hp == 1.0:
+                        self._frozen_opp_last_hp = current_hp
                 else:
                     hp_dealt = self._frozen_opp_last_hp - current_hp
                     if hp_dealt > 0:
-                        # Dealt damage — reward and reset counter
                         reward += 0.05 * hp_dealt * 100
                         self._consec_frozen_wasted = 0
                     else:
-                        # No damage dealt while frozen mon is active — escalate  3 turn grace period
                         self._consec_frozen_wasted += 1
                         if self._consec_frozen_wasted > 3:
-                            penalty = 0.02 * (self._consec_frozen_wasted - 2)
-                            reward -= min(penalty, 0.5)
+                            penalty = 0.05 * (self._consec_frozen_wasted - 2)
+                            reward -= min(penalty, 1.0)
                     self._frozen_opp_last_hp = current_hp
             else:
-                # Frozen mon exists but agent switched it to the bench — penalize
-                # every turn we're not finishing it, counter keeps accumulating
+                # Frozen mon is benched — penalize, counter keeps accumulating
+                # Do NOT clear _frozen_opp_species or reset _frozen_opp_last_hp
                 self._consec_frozen_wasted += 1
-                penalty = 0.02 * self._consec_frozen_wasted
-                reward -= min(penalty, 0.5)
-                # Clear active tracker so HP baseline resets correctly when we switch back
-                self._frozen_opp_species = None
+                penalty = 0.05 * self._consec_frozen_wasted
+                reward -= min(penalty, 1.0)
         else:
-            # No frozen mons on opponent's team — clear all tracking
+            # No frozen mons — clear all tracking
             self._frozen_opp_species = None
+            self._frozen_opp_last_hp = 1.0
             self._consec_frozen_wasted = 0
 
         # --- Wasted move penalty ---
-        # Escalating penalty for repeatedly doing nothing useful:
-        # no HP change on either side and no force switch (e.g. failed status moves,
-        # maxed stat boosts, spamming Thunder Wave on paralyzed target).
-        # Grace period of 3 turns before any penalty kicks in.
-        opp_hp_actually_dropped = (self._prev_opp_hp - opp_hp_now) > 0.001
-        my_hp_actually_dropped = (self._prev_my_hp - my_hp_now) > 0.001
+        # Uses old_opp_hp / old_my_hp so the delta is computed correctly
+        opp_hp_actually_dropped = (old_opp_hp - opp_hp_now) > 0.001
+        my_hp_actually_dropped = (old_my_hp - my_hp_now) > 0.001
 
         if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
         elif not my_hp_actually_dropped and not battle.force_switch:
             self._consec_wasted_moves += 1
-            if self._consec_wasted_moves > 3:  # 3-turn grace period
+            if self._consec_wasted_moves > 3:
                 penalty = 0.005 * (self._consec_wasted_moves - 3)
-                penalty = min(penalty, 0.3)    # soft cap
-                reward -= penalty
+                reward -= min(penalty, 0.3)
         else:
             self._consec_wasted_moves = 0
 
@@ -599,20 +587,19 @@ class CustomEnv(SinglesEnv):
             own_speed = np.float32([self._get_speed(battle.active_pokemon)])
             opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
 
-            opp_move_eff = self._get_opp_move_effectiveness(battle)  # 4
+            opp_move_eff = self._get_opp_move_effectiveness(battle)
 
-            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])       # 1
-            opp_active_paralyzed = np.float32([1.0 if _is_paralyzed(battle.opponent_active_pokemon) else 0.0]) # 1
+            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])
+            opp_active_paralyzed = np.float32([1.0 if _is_paralyzed(battle.opponent_active_pokemon) else 0.0])
 
-            # Stat boosts normalized -6..+6 → -1..1 so agent knows when buffs are maxed
             own_atk_boost = np.float32([
                 battle.active_pokemon.boosts.get("atk", 0) / 6.0
                 if battle.active_pokemon else 0.0
-            ])  # 1
+            ])
             own_spe_boost = np.float32([
                 battle.active_pokemon.boosts.get("spa", 0) / 6.0
                 if battle.active_pokemon else 0.0
-            ])  # 1
+            ])
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
@@ -654,8 +641,23 @@ class CustomEnv(SinglesEnv):
 
 
 # -----------------------------
+# Wrapper chain walker
+# -----------------------------
+def _get_custom_env(env) -> Optional[CustomEnv]:
+    """Walk the wrapper chain until we find the CustomEnv instance."""
+    obj = env
+    while obj is not None:
+        if isinstance(obj, CustomEnv):
+            return obj
+        obj = getattr(obj, 'env', None)
+    return None
+
+
+# -----------------------------
 # Masking function
 # -----------------------------
+FROZEN_GRACE_PERIOD = 5
+
 def mask_env(env):
     battle = env.env.battle1
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
@@ -670,7 +672,7 @@ def mask_env(env):
     move_offset = 6
     choose_default = 10
 
-    # Truly no options at all — must use default
+    # Truly no options — must use default
     if len(available_moves) == 0 and len(available_switches) == 0:
         action_mask[choose_default] = 1
         return action_mask
@@ -680,18 +682,33 @@ def mask_env(env):
         action_mask[choose_default] = 1
         return action_mask
 
-    # Enable move actions
+    # Check frozen opponent and grace period
+    opp = battle.opponent_active_pokemon
+    opp_is_frozen = opp is not None and _is_frozen(opp)
+    grace_expired = False
+
+    if opp_is_frozen:
+        custom_env = _get_custom_env(env)
+        if custom_env is not None:
+            grace_expired = custom_env._consec_frozen_wasted >= FROZEN_GRACE_PERIOD
+        else:
+            print("[mask_env] WARNING: Could not find CustomEnv in wrapper chain!")
+
+    # Enable move actions — after grace period, block status moves vs frozen opponent
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
             if move in available_moves:
+                if opp_is_frozen and grace_expired and move.base_power == 0:
+                    continue  # block zero-power moves once grace expires
                 action_mask[slot + move_offset] = 1
 
-    # Enable all valid switches — reward shaping handles frozen opponent stalling
-    for slot, mon in enumerate(team):
-        if mon in available_switches:
-            action_mask[slot] = 1
+    # Enable switches — block after grace period if opponent is frozen
+    if not (opp_is_frozen and grace_expired) or battle.force_switch:
+        for slot, mon in enumerate(team):
+            if mon in available_switches:
+                action_mask[slot] = 1
 
-    # choose_default only as absolute last resort
+    # Last resort fallback
     if not any(action_mask):
         action_mask[choose_default] = 1
 
@@ -862,23 +879,21 @@ def eval_model(model_name: str, n_battles: int = 100):
 # Run
 # -----------------------------
 if __name__ == "__main__":
-    multiprocessing.set_start_method("spawn", force=True)  # required on Windows
+    multiprocessing.set_start_method("spawn", force=True)
 
-    MODE = "new"             # "new" | "continue" | "eval"
+    MODE = "eval"
     MODEL_NAME = "ParallelTest8"
     training_steps = 500000
 
-    N_ENVS_RUN = 6       # 1-8, lower = less CPU usage
-    USE_SUBPROC = True   # False if using only 1 env
+    N_ENVS_RUN = 6
+    USE_SUBPROC = True
 
     if MODE == "new":
         train_new(MODEL_NAME, training_steps, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
     elif MODE == "continue":
         train_continue(MODEL_NAME, training_steps, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=100)
+        eval_model(MODEL_NAME, n_battles=500)
 
-# Tensorboard command: tensorboard --logdir ./tensorboard_logs/
-
-# if running on newer python version that doesnt support tensorboard yet
-# .venv311\Scripts\python.exe -m tensorboard.main --logdir ./tensorboard_logs/
+# Tensorboard: tensorboard --logdir ./tensorboard_logs/
+# Older Python: .venv311\Scripts\python.exe -m tensorboard.main --logdir ./tensorboard_logs/
