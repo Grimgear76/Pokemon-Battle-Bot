@@ -353,9 +353,9 @@ class CustomEnv(SinglesEnv):
             account_configuration1=agent_config,
             account_configuration2=opponent_config
         )
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)          ----------------------------------------------------------(For easier finding)
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)    #      ----------------------------------------------------------(For easier finding)
         #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
 
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
@@ -425,7 +425,7 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
-        # Per-turn stall penalty
+        # Per-turn stall penalty up to -1.0 because max steps is 1000
         reward -= 0.001
 
         # --- Frozen opponent tracking ---
