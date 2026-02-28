@@ -383,22 +383,19 @@ class CustomEnv(SinglesEnv):
         new_opp_faints = opp_fainted_now - self._prev_opp_fainted
         new_my_faints = my_fainted_now - self._prev_my_fainted
         reward += 0.05 * new_opp_faints
-        reward -= 0.05 * new_my_faints  #lower?
+        reward -= 0.05 * new_my_faints
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted = my_fainted_now
 
-        # --- HP tracking (offensive only) ---
-        # Only reward dealing damage to the opponent.
-        # The defensive penalty (my_hp_lost) has been removed to prevent the
-        # agent from farming reward by avoiding damage instead of attacking.
+        # --- HP tracking ---
         old_opp_hp = self._prev_opp_hp
         old_my_hp = self._prev_my_hp
         opp_hp_now = self._get_team_hp_fraction(battle.opponent_team)
         my_hp_now = self._get_team_hp_fraction(battle.team)
         opp_hp_lost = old_opp_hp - opp_hp_now
         my_hp_lost = old_my_hp - my_hp_now
-        # reward += 0.002 * max(opp_hp_lost, 0) * 100
-        # Note: my_hp_lost is tracked but no longer penalised
+        reward += 0.05 * max(opp_hp_lost, 0)   # reward dealing damage             50% damage ex 0.05 * 0.5 = 0.025
+        reward -= 0.025 * max(my_hp_lost, 0)   # small penalty for taking damage   50% damage ex 0.04 * 0.5 = 0.02
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp = my_hp_now
 
@@ -406,7 +403,7 @@ class CustomEnv(SinglesEnv):
         my_hp_actually_dropped = (old_my_hp - my_hp_now) > 0.001
 
         # --- Per-turn stall penalty ---
-        reward -= 0.003
+        reward -= 0.002
 
         # --- Switch penalty ---
         # Grace of 2 switches allows legitimate pivoting (e.g. bad matchup).
@@ -440,9 +437,8 @@ class CustomEnv(SinglesEnv):
                         reward += 0.05 * hp_dealt * 100
                         self._consec_frozen_wasted = 0
                     else:
-                        # No damage dealt to frozen mon — wasted move penalty
                         self._consec_frozen_wasted += 1
-                        if self._consec_frozen_wasted > 3:
+                        if self._consec_frozen_wasted > 2:
                             penalty = 0.05 * (self._consec_frozen_wasted - 2)
                             reward -= min(penalty, 1.0)
                     self._frozen_opp_last_hp = current_hp
@@ -452,15 +448,31 @@ class CustomEnv(SinglesEnv):
             self._consec_frozen_wasted = 0
 
         # --- Wasted move penalty ---
-        # Tightened: kicks in after just 1 non-damaging, non-switching turn
-        # (down from 3) to more aggressively discourage status-spam loops.
+        # Penalises spamming zero-effect moves (e.g. Spore on already-sleeping target).
+        # Two separate tiers:
+        #   - Opponent is statused (asleep/frozen/paralyzed/burned/poisoned): tighter grace
+        #     (1 free turn) and stronger coefficient (0.05) to aggressively discourage
+        #     status-spam loops like repeatedly using Spore on a sleeping foe.
+        #   - No opponent status: slightly looser grace (2 free turns) and softer
+        #     coefficient (0.03) to allow occasional non-damaging moves (e.g. Swords Dance).
+        opp_is_statused = (
+            opp_active is not None and opp_active.status is not None
+        )
+
         if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
         elif not my_hp_actually_dropped and not battle.force_switch and not self._last_action_was_switch:
             self._consec_wasted_moves += 1
-            if self._consec_wasted_moves > 2:
-                penalty = 0.01 * (self._consec_wasted_moves - 1)
-                reward -= min(penalty, 1.0)
+            if opp_is_statused:
+                # Tight penalty: kicks in after 1 free wasted turn, coefficient 0.05
+                if self._consec_wasted_moves > 1:
+                    penalty = 0.05 * self._consec_wasted_moves
+                    reward -= min(penalty, 1.0)
+            else:
+                # Softer penalty: kicks in after 2 free wasted turns, coefficient 0.03
+                if self._consec_wasted_moves > 2:
+                    penalty = 0.03 * (self._consec_wasted_moves - 1)
+                    reward -= min(penalty, 1.0)
         else:
             self._consec_wasted_moves = 0
 

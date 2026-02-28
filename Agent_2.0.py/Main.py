@@ -11,8 +11,8 @@ if __name__ == "__main__":
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "human" | "league"
     MODE = "eval"
-    MODEL_NAME     = "ParallelTest10"
-    TRAINING_STEPS = 250000
+    MODEL_NAME     = "ParallelTest11"
+    TRAINING_STEPS = 500000
 
     N_ENVS_RUN  = 6
     USE_SUBPROC = True
