@@ -79,7 +79,6 @@ logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 # Status helpers
 # -----------------------------
 def _has_status(mon, status_enum) -> bool:
-    """Generic status check against a PokemonStatus enum value."""
     if mon is None:
         return False
     try:
@@ -124,9 +123,8 @@ def _is_poisoned(mon) -> bool:
 
 def _encode_status_flags(mon) -> np.ndarray:
     """
-    Returns a 5-element float32 array of binary status flags for a mon:
+    Returns a 5-element float32 array of binary status flags:
     [asleep, frozen, paralyzed, burned, poisoned]
-    Each element is 1.0 if the condition is active, 0.0 otherwise.
     """
     return np.float32([
         1.0 if _is_asleep(mon)    else 0.0,
@@ -135,6 +133,61 @@ def _encode_status_flags(mon) -> np.ndarray:
         1.0 if _is_burned(mon)    else 0.0,
         1.0 if _is_poisoned(mon)  else 0.0,
     ])
+
+
+def _encode_boosts(mon) -> np.ndarray:
+    """
+    Returns a 5-element float32 array of stat boosts normalized to [-1, 1]:
+    [atk, def, spe, spa, spd]
+    Returns zeros if mon is None.
+    """
+    if mon is None:
+        return np.zeros(5, dtype=np.float32)
+    boosts = mon.boosts if mon.boosts else {}
+    return np.float32([
+        boosts.get("atk", 0) / 6.0,
+        boosts.get("def", 0) / 6.0,
+        boosts.get("spe", 0) / 6.0,
+        boosts.get("spa", 0) / 6.0,
+        boosts.get("spd", 0) / 6.0,
+    ])
+
+
+# Canonical Gen 2 type list — 18 types, fixed order for consistent one-hot encoding.
+# Must never be reordered between training runs.
+GEN2_TYPES = [
+    "Normal", "Fire", "Water", "Electric", "Grass", "Ice",
+    "Fighting", "Poison", "Ground", "Flying", "Psychic", "Bug",
+    "Rock", "Ghost", "Dragon", "Dark", "Steel", "???",
+]
+_TYPE_TO_IDX = {t.lower(): i for i, t in enumerate(GEN2_TYPES)}
+N_TYPES = len(GEN2_TYPES)  # 18
+
+
+def _type_onehot(type_obj) -> np.ndarray:
+    """Return an 18-dim one-hot vector for a poke-env Type object, or all-zeros if None."""
+    vec = np.zeros(N_TYPES, dtype=np.float32)
+    if type_obj is None:
+        return vec
+    idx = _TYPE_TO_IDX.get(type_obj.name.lower(), -1)
+    if idx >= 0:
+        vec[idx] = 1.0
+    return vec
+
+
+def _encode_active_mon(mon) -> np.ndarray:
+    """
+    Returns a 38-element float32 array:
+      [hp(1), status(1), type1_onehot(18), type2_onehot(18)]
+    type2 is all-zeros for mono-type Pokémon.
+    """
+    hp = np.float32([-1.0 if (mon is None or mon.fainted or mon.max_hp == 0)
+                     else (mon.current_hp / mon.max_hp) * 2 - 1])
+    status_key = (mon.status.value if mon.status else None) if mon is not None else None
+    status = np.float32([STATUS_MAP.get(status_key, 0.0)])
+    type1 = _type_onehot(mon.type_1 if mon is not None else None)
+    type2 = _type_onehot(mon.type_2 if mon is not None else None)
+    return np.concatenate([hp, status, type1, type2])  # 1+1+18+18 = 38
 
 
 # -----------------------------
@@ -252,24 +305,26 @@ class CustomEnv(SinglesEnv):
             agent: Discrete(ACTION_SPACE_SIZE)
             for agent in self.possible_agents
         }
-        self.gen_data = GenData.from_gen(1)
+        # Gen 2 data
+        self.gen_data = GenData.from_gen(2)
         self.species_to_id = {
             name: i for i, name in enumerate(self.gen_data.pokedex.keys())
         }
-        self._all_types = list(self.gen_data.type_chart.keys())
-        self._type_to_id = {t: i for i, t in enumerate(self._all_types)}
-        self._type_count = max(len(self._all_types) - 1, 1)
+
+        # Build item ID lookup from Gen 2 data
+        try:
+            all_items = list(self.gen_data.items.keys())
+        except AttributeError:
+            all_items = []
+        self._item_to_id = {name: i + 1 for i, name in enumerate(all_items)}
+        self._item_count = max(len(self._item_to_id), 1)
 
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
-        self._consec_frozen_wasted: int = 0
         self._consec_wasted_moves: int = 0
         self._consec_wasted_switches: int = 0
-        self._frozen_opp_species: Optional[str] = None
-        self._frozen_opp_last_hp: float = 1.0
-        self._frozen_mons: set = set()
         self._last_action_was_switch: bool = False
 
     def action_to_order(self, action, battle, fake=False, strict=True):
@@ -284,6 +339,21 @@ class CustomEnv(SinglesEnv):
             speed = self.gen_data.pokedex[mon.species.lower()]["baseStats"]["spe"]
             return (speed / MAX_SPEED) * 2 - 1
         except (KeyError, TypeError):
+            return 0.0
+
+    def _get_item_id(self, mon) -> float:
+        """Returns normalized item ID in [-1, 1]. 0.0 means no item or unknown."""
+        if mon is None:
+            return 0.0
+        try:
+            item = mon.item
+            if item is None or item == "" or item == "unknown_item":
+                return 0.0
+            item_id = self._item_to_id.get(item.lower(), 0)
+            if item_id == 0:
+                return 0.0
+            return (item_id / self._item_count) * 2 - 1
+        except Exception:
             return 0.0
 
     def _get_type_advantage(self, attacker, defender) -> float:
@@ -346,12 +416,8 @@ class CustomEnv(SinglesEnv):
         self._prev_my_fainted = 0
         self._prev_opp_hp = 1.0
         self._prev_my_hp = 1.0
-        self._consec_frozen_wasted = 0
         self._consec_wasted_moves = 0
         self._consec_wasted_switches = 0
-        self._frozen_opp_species = None
-        self._frozen_opp_last_hp = 1.0
-        self._frozen_mons = set()
         self._last_action_was_switch = False
 
     def _get_team_hp_fraction(self, team) -> float:
@@ -367,6 +433,7 @@ class CustomEnv(SinglesEnv):
 
     def calc_reward(self, battle) -> float:
         reward = 0.0
+
         if battle.finished:
             if battle.won is None:
                 reward = -0.5
@@ -378,124 +445,66 @@ class CustomEnv(SinglesEnv):
             return reward
 
         # --- Faint tracking ---
+        # KO reward: +0.04 per opponent fainted, -0.08 per own fainted
+        # A full 6-0 sweep = +0.24 in KO rewards, meaningful vs win=+1.0
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
-        my_fainted_now = sum(p.fainted for p in battle.team.values())
+        my_fainted_now  = sum(p.fainted for p in battle.team.values())
+
         new_opp_faints = opp_fainted_now - self._prev_opp_fainted
-        new_my_faints = my_fainted_now - self._prev_my_fainted
-        reward += 0.05 * new_opp_faints
-        reward -= 0.05 * new_my_faints
+        new_my_faints  = my_fainted_now  - self._prev_my_fainted
+
+        reward += 0.04 * new_opp_faints
+        reward -= 0.04 * new_my_faints
+
         self._prev_opp_fainted = opp_fainted_now
-        self._prev_my_fainted = my_fainted_now
+        self._prev_my_fainted  = my_fainted_now
 
         # --- HP tracking ---
+        # Damage reward: 50% HP dealt = +0.001  (0.002 * 0.5 = 0.001)
         old_opp_hp = self._prev_opp_hp
-        old_my_hp = self._prev_my_hp
-        opp_hp_now = self._get_team_hp_fraction(battle.opponent_team)
-        my_hp_now = self._get_team_hp_fraction(battle.team)
-        opp_hp_lost = old_opp_hp - opp_hp_now
-        my_hp_lost = old_my_hp - my_hp_now
-        reward += 0.05 * max(opp_hp_lost, 0)   # reward dealing damage             50% damage ex 0.05 * 0.5 = 0.025
-        reward -= 0.025 * max(my_hp_lost, 0)   # small penalty for taking damage   50% damage ex 0.04 * 0.5 = 0.02
-        self._prev_opp_hp = opp_hp_now
-        self._prev_my_hp = my_hp_now
+        old_my_hp  = self._prev_my_hp
 
-        opp_hp_actually_dropped = (old_opp_hp - opp_hp_now) > 0.001
-        my_hp_actually_dropped = (old_my_hp - my_hp_now) > 0.001
+        opp_hp_now = self._get_team_hp_fraction(battle.opponent_team)
+        my_hp_now  = self._get_team_hp_fraction(battle.team)
+
+        opp_hp_lost = old_opp_hp - opp_hp_now
+        my_hp_lost  = old_my_hp  - my_hp_now
+
+        if opp_hp_lost > 0.001:
+            reward += 0.002 * opp_hp_lost * 100
+        if my_hp_lost > 0.001:
+            reward -= 0.002 * my_hp_lost * 100
+
+        self._prev_opp_hp = opp_hp_now
+        self._prev_my_hp  = my_hp_now
+
+        opp_hp_actually_dropped = opp_hp_lost > 0.001
+        my_hp_actually_dropped  = my_hp_lost  > 0.001
 
         # --- Per-turn stall penalty ---
-        reward -= 0.002
+        reward -= 0.001
 
         # --- Switch penalty ---
-        # Grace of 2 switches allows legitimate pivoting (e.g. bad matchup).
-        # After that ramp is steeper: -0.2, -0.4 ... capped at -1.0 per turn.
-        if self._last_action_was_switch and not opp_hp_actually_dropped and not battle.force_switch:
+        # Grace of 3 consecutive non-damaging switches before penalty kicks in.
+        if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
             self._consec_wasted_switches += 1
-            if self._consec_wasted_switches > 2:
-                penalty = 0.2 * (self._consec_wasted_switches - 2)
-                reward -= min(penalty, 1.0)
+            if self._consec_wasted_switches > 3:
+                reward -= 0.01 * (self._consec_wasted_switches - 3)
         else:
             self._consec_wasted_switches = 0
 
-        # --- Frozen opponent tracking (reward for dealing damage to frozen mon) ---
-        for mon in battle.opponent_team.values():
-            if _is_frozen(mon):
-                self._frozen_mons.add(mon.species)
-            elif mon.species in self._frozen_mons and not _is_frozen(mon):
-                self._frozen_mons.discard(mon.species)
-
-        opp_active = battle.opponent_active_pokemon
-        if self._frozen_mons:
-            if opp_active and opp_active.species in self._frozen_mons:
-                current_hp = (opp_active.current_hp / opp_active.max_hp) if opp_active.max_hp > 0 else 0.0
-                if opp_active.species != self._frozen_opp_species:
-                    self._frozen_opp_species = opp_active.species
-                    if self._frozen_opp_last_hp == 1.0:
-                        self._frozen_opp_last_hp = current_hp
-                else:
-                    hp_dealt = self._frozen_opp_last_hp - current_hp
-                    if hp_dealt > 0:
-                        reward += 0.05 * hp_dealt * 100
-                        self._consec_frozen_wasted = 0
-                    else:
-                        self._consec_frozen_wasted += 1
-                        if self._consec_frozen_wasted > 2:
-                            penalty = 0.05 * (self._consec_frozen_wasted - 2)
-                            reward -= min(penalty, 1.0)
-                    self._frozen_opp_last_hp = current_hp
-        else:
-            self._frozen_opp_species = None
-            self._frozen_opp_last_hp = 1.0
-            self._consec_frozen_wasted = 0
-
         # --- Wasted move penalty ---
-        # Penalises spamming zero-effect moves (e.g. Spore on already-sleeping target).
-        # Two separate tiers:
-        #   - Opponent is statused (asleep/frozen/paralyzed/burned/poisoned): tighter grace
-        #     (1 free turn) and stronger coefficient (0.05) to aggressively discourage
-        #     status-spam loops like repeatedly using Spore on a sleeping foe.
-        #   - No opponent status: slightly looser grace (2 free turns) and softer
-        #     coefficient (0.03) to allow occasional non-damaging moves (e.g. Swords Dance).
-        opp_is_statused = (
-            opp_active is not None and opp_active.status is not None
-        )
-
         if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
-        elif not my_hp_actually_dropped and not battle.force_switch and not self._last_action_was_switch:
+        elif not my_hp_actually_dropped and not battle.force_switch:
             self._consec_wasted_moves += 1
-            if opp_is_statused:
-                # Tight penalty: kicks in after 1 free wasted turn, coefficient 0.05
-                if self._consec_wasted_moves > 1:
-                    penalty = 0.05 * self._consec_wasted_moves
-                    reward -= min(penalty, 1.0)
-            else:
-                # Softer penalty: kicks in after 2 free wasted turns, coefficient 0.03
-                if self._consec_wasted_moves > 2:
-                    penalty = 0.03 * (self._consec_wasted_moves - 1)
-                    reward -= min(penalty, 1.0)
+            if self._consec_wasted_moves > 3:
+                penalty = 0.005 * (self._consec_wasted_moves - 3)
+                reward -= min(penalty, 0.3)
         else:
             self._consec_wasted_moves = 0
 
         return reward
-
-    def _encode_active_mon(self, mon) -> np.ndarray:
-        features = np.zeros(5, dtype=np.float32)
-        if mon is None:
-            return features
-        if mon.fainted or mon.max_hp == 0:
-            features[0] = -1.0
-        else:
-            features[0] = (mon.current_hp / mon.max_hp) * 2 - 1
-        status_key = mon.status.value if mon.status else None
-        features[1] = STATUS_MAP.get(status_key, 0.0)
-        if mon.species is not None:
-            idx = self.species_to_id.get(mon.species.lower(), 0)
-            features[2] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
-        if mon.type_1 is not None:
-            features[3] = (self._type_to_id.get(mon.type_1.name, 0) / self._type_count) * 2 - 1
-        if mon.type_2 is not None:
-            features[4] = (self._type_to_id.get(mon.type_2.name, 0) / self._type_count) * 2 - 1
-        return features
 
     def embed_battle(self, battle: AbstractBattle):
         try:
@@ -557,17 +566,22 @@ class CustomEnv(SinglesEnv):
             if battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
-            active_features = self._encode_active_mon(battle.active_pokemon)
-            opp_active_features = self._encode_active_mon(battle.opponent_active_pokemon)
-            own_speed = np.float32([self._get_speed(battle.active_pokemon)])
-            opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
-            opp_move_eff = self._get_opp_move_effectiveness(battle)
-            own_atk_boost = np.float32([battle.active_pokemon.boosts.get("atk", 0) / 6.0 if battle.active_pokemon else 0.0])
-            own_spe_boost = np.float32([battle.active_pokemon.boosts.get("spa", 0) / 6.0 if battle.active_pokemon else 0.0])
+            # One-hot typed active mon features (38 each)
+            active_features     = _encode_active_mon(battle.active_pokemon)
+            opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
 
-            # --- Explicit per-status binary flags for both active mons ---
-            # Own active mon: [asleep, frozen, paralyzed, burned, poisoned]  (5)
-            # Opp active mon: [asleep, frozen, paralyzed, burned, poisoned]  (5)
+            own_speed    = np.float32([self._get_speed(battle.active_pokemon)])
+            opp_speed    = np.float32([self._get_speed(battle.opponent_active_pokemon)])
+            opp_move_eff = self._get_opp_move_effectiveness(battle)
+
+            # All boosts normalized to [-1, 1] via /6
+            own_boosts = _encode_boosts(battle.active_pokemon)
+            opp_boosts = _encode_boosts(battle.opponent_active_pokemon)
+
+            # Gen 2: held item IDs
+            own_item_id = np.float32([self._get_item_id(battle.active_pokemon)])
+            opp_item_id = np.float32([self._get_item_id(battle.opponent_active_pokemon)])
+
             own_status_flags = _encode_status_flags(battle.active_pokemon)
             opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
 
@@ -584,17 +598,19 @@ class CustomEnv(SinglesEnv):
                 self_status,             # 6
                 opponent_status,         # 6
                 special_case,            # 2
-                active_features,         # 5
-                opp_active_features,     # 5
+                active_features,         # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
+                opp_active_features,     # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
                 own_speed,               # 1
                 opp_speed,               # 1
                 opp_move_eff,            # 4
-                own_atk_boost,           # 1
-                own_spe_boost,           # 1
-                own_status_flags,        # 5  [slp, frz, par, brn, psn]
-                opp_status_flags,        # 5  [slp, frz, par, brn, psn]
+                own_boosts,              # 5   [atk, def, spe, spa, spd]
+                opp_boosts,              # 5   [atk, def, spe, spa, spd]
+                own_item_id,             # 1
+                opp_item_id,             # 1
+                own_status_flags,        # 5   [slp, frz, par, brn, psn]
+                opp_status_flags,        # 5   [slp, frz, par, brn, psn]
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+5+5+1+1+4+1+1+5+5 = 90
+            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5 = 166
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -608,9 +624,6 @@ class CustomEnv(SinglesEnv):
         print("[Environment Closed]")
 
     def step(self, action):
-        # poke-env passes actions as a dict {agent_name: int} in multi-agent format.
-        # Extract the raw int just for switch tracking, but pass the original action
-        # to super().step() unchanged so poke-env receives what it expects.
         if isinstance(action, dict):
             raw_action = next(iter(action.values()))
         else:
@@ -634,8 +647,6 @@ def _get_custom_env(env) -> Optional[CustomEnv]:
 # -----------------------------
 # Masking function
 # -----------------------------
-FROZEN_GRACE_PERIOD = 5
-
 def mask_env(env):
     battle = env.env.battle1
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
@@ -661,35 +672,15 @@ def mask_env(env):
     own_mon = battle.active_pokemon
     own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
 
-    # --- Opponent frozen logic ---
-    opp = battle.opponent_active_pokemon
-    opp_is_frozen = opp is not None and _is_frozen(opp)
-    grace_expired = False
-
-    if opp_is_frozen:
-        custom_env = _get_custom_env(env)
-        if custom_env is not None:
-            grace_expired = custom_env._consec_frozen_wasted >= FROZEN_GRACE_PERIOD
-        else:
-            print("[mask_env] WARNING: Could not find CustomEnv in wrapper chain!")
-
     # --- Build move mask ---
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
             if move in available_moves:
-                # If opp is frozen and grace expired, block zero-power moves
-                if opp_is_frozen and grace_expired and move.base_power == 0:
-                    continue
                 action_mask[slot + move_offset] = 1
 
     # --- Build switch mask ---
-    # Always allow switches in force-switch situations.
-    # Also always allow switches if we are incapacitated (sleep/freeze).
-    allow_switch = (
-        battle.force_switch or
-        own_incapacitated or
-        not (opp_is_frozen and grace_expired)
-    )
+    # Always allow switching when incapacitated (frozen/asleep) or force switch
+    allow_switch = battle.force_switch or own_incapacitated or bool(available_moves)
     if allow_switch:
         for slot, mon in enumerate(team):
             if mon in available_switches:
@@ -704,11 +695,11 @@ def mask_env(env):
 # -----------------------------
 # Parallel env factory
 # -----------------------------
-def make_env_fn(env_id: int, seed: int = 0):
+def make_env_fn(env_id: int, seed: int = 0, battle_format: str = "gen2randombattle"):
     def _init():
         set_random_seed(seed + env_id)
         env = CustomEnv.create_single_agent_env(
-            {"battle_format": "gen1randombattle"},
+            {"battle_format": battle_format},
             env_id=env_id
         )
         env = Monitor(env)
@@ -716,11 +707,11 @@ def make_env_fn(env_id: int, seed: int = 0):
     return _init
 
 
-def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True):
-    env_fns = [make_env_fn(env_id=i, seed=42) for i in range(n_envs)]
+def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
+    env_fns = [make_env_fn(env_id=i, seed=42, battle_format=battle_format) for i in range(n_envs)]
     if use_subproc and n_envs > 1:
-        print(f"[VecEnv] Launching {n_envs} parallel environments (SubprocVecEnv)")
+        print(f"[VecEnv] Launching {n_envs} parallel environments (SubprocVecEnv) | format={battle_format}")
         return SubprocVecEnv(env_fns, start_method="spawn")
     else:
-        print(f"[VecEnv] Using DummyVecEnv with {n_envs} env(s)")
+        print(f"[VecEnv] Using DummyVecEnv with {n_envs} env(s) | format={battle_format}")
         return DummyVecEnv(env_fns)

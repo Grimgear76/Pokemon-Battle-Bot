@@ -11,9 +11,10 @@ if __name__ == "__main__":
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "human" | "league"
     MODE = "eval"
-    MODEL_NAME     = "ParallelTest11"
-    TRAINING_STEPS = 500000
+    MODEL_NAME     = "ParallelTest13"
+    TRAINING_STEPS = 200000
 
+    GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6
     USE_SUBPROC = True
 
@@ -25,28 +26,31 @@ if __name__ == "__main__":
     # Ladder example:
     #   new model name (Learner)
     #   LEARNER_NAME = "Gen2"  |  OPPONENT_NAME = "ParallelTest8"
-    #   next iteration 
+    #   next iteration
     #   LEARNER_NAME = "Gen3"  |  OPPONENT_NAME = "Gen2"
     LEARNER_NAME  = "Test8Gen1"
     OPPONENT_NAME = "ParallelTest8"
+
+    # Derive battle format from GEN
+    BATTLE_FORMAT = f"gen{GEN}randombattle"
 
     # -----------------------------
     # Run
     # -----------------------------
     if MODE == "new":
-        train_new(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
+        train_new(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "continue":
-        train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
+        train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=100)
+        eval_model(MODEL_NAME, n_battles=200, battle_format=BATTLE_FORMAT)
 
     elif MODE == "human":
-        asyncio.run(play_vs_human(MODEL_NAME, HUMAN_USERNAME, N_HUMAN_BATTLES))
+        asyncio.run(play_vs_human(MODEL_NAME, HUMAN_USERNAME, N_HUMAN_BATTLES, battle_format=BATTLE_FORMAT))
 
     elif MODE == "league":
-        train_vs_opponent(LEARNER_NAME, OPPONENT_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC)
+        train_vs_opponent(LEARNER_NAME, OPPONENT_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
 
 # -----------------------------

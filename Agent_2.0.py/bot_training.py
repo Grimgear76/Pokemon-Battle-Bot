@@ -22,7 +22,8 @@ from constants import (
 )
 from environment import (
     make_vec_env, ProgressCallback, EntropyMonitorCallback,
-    CustomEnv, mask_env, _is_frozen, _is_paralyzed
+    CustomEnv, mask_env, _is_frozen, _is_paralyzed,
+    _encode_boosts, _encode_status_flags, _encode_active_mon
 )
 
 
@@ -42,7 +43,7 @@ def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
         gae_lambda=GAE_LAMBDA,
         ent_coef=ENT_COEF,
         clip_range=CLIP_RANGE,
-        vf_coef=0.3, 
+        vf_coef=0.5,
         tensorboard_log=tensorboard_log,
         policy_kwargs=dict(net_arch=NET_ARCH)
     )
@@ -51,14 +52,14 @@ def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
 # -----------------------------
 # Train new
 # -----------------------------
-def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True):
+def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
     path = model_path(model_name)
     if path.exists():
         print(f"Model '{model_name}' already exists! Delete it or choose another name.")
         return
 
-    print(f"[Training Started] model={model_name}, timesteps={timesteps:,}, n_envs={n_envs}")
-    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc)
+    print(f"[Training Started] model={model_name}, timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}")
+    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format)
     model = build_model(train_env, model_name=model_name)
 
     callbacks = CallbackList([
@@ -79,14 +80,14 @@ def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc
 # -----------------------------
 # Continue training
 # -----------------------------
-def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True):
+def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found! Train a new model first.")
         return
 
-    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}")
-    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc)
+    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}")
+    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format)
     model = MaskablePPO.load(
         path,
         env=train_env,
@@ -117,14 +118,14 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
 # -----------------------------
 # Eval
 # -----------------------------
-def eval_model(model_name: str, n_battles: int = 100):
+def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2randombattle"):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found!")
         return
 
-    print(f"[Evaluating] model={model_name}, battles={n_battles}")
-    eval_env = make_vec_env(n_envs=1, use_subproc=False)
+    print(f"[Evaluating] model={model_name}, battles={n_battles}, format={battle_format}")
+    eval_env = make_vec_env(n_envs=1, use_subproc=False, battle_format=battle_format)
     model = MaskablePPO.load(path, env=eval_env, policy_kwargs=dict(net_arch=NET_ARCH))
 
     wins, losses, draws = 0, 0, 0
@@ -168,11 +169,16 @@ class InferenceAgent(Player):
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
         self._model = model
-        self._gen_data = GenData.from_gen(1)
+        # Gen 2 data (used for move effectiveness and speed lookups)
+        self._gen_data = GenData.from_gen(2)
         self._species_to_id = {name: i for i, name in enumerate(self._gen_data.pokedex.keys())}
-        self._all_types = list(self._gen_data.type_chart.keys())
-        self._type_to_id = {t: i for i, t in enumerate(self._all_types)}
-        self._type_count = max(len(self._all_types) - 1, 1)
+        # Item lookup
+        try:
+            all_items = list(self._gen_data.items.keys())
+        except AttributeError:
+            all_items = []
+        self._item_to_id = {name: i + 1 for i, name in enumerate(all_items)}
+        self._item_count = max(len(self._item_to_id), 1)
 
     def _get_speed(self, mon) -> float:
         if mon is None or mon.species is None:
@@ -183,21 +189,19 @@ class InferenceAgent(Player):
         except (KeyError, TypeError):
             return 0.0
 
-    def _encode_active_mon(self, mon) -> np.ndarray:
-        features = np.zeros(5, dtype=np.float32)
+    def _get_item_id(self, mon) -> float:
         if mon is None:
-            return features
-        features[0] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
-        status_key = mon.status.value if mon.status else None
-        features[1] = STATUS_MAP.get(status_key, 0.0)
-        if mon.species is not None:
-            idx = self._species_to_id.get(mon.species.lower(), 0)
-            features[2] = (idx / (len(self._species_to_id) - 1)) * 2 - 1
-        if mon.type_1 is not None:
-            features[3] = (self._type_to_id.get(mon.type_1.name, 0) / self._type_count) * 2 - 1
-        if mon.type_2 is not None:
-            features[4] = (self._type_to_id.get(mon.type_2.name, 0) / self._type_count) * 2 - 1
-        return features
+            return 0.0
+        try:
+            item = mon.item
+            if item is None or item == "" or item == "unknown_item":
+                return 0.0
+            item_id = self._item_to_id.get(item.lower(), 0)
+            if item_id == 0:
+                return 0.0
+            return (item_id / self._item_count) * 2 - 1
+        except Exception:
+            return 0.0
 
     def _embed(self, battle) -> np.ndarray:
         try:
@@ -255,8 +259,10 @@ class InferenceAgent(Player):
             if battle.active_pokemon and battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
-            active_features = self._encode_active_mon(battle.active_pokemon)
-            opp_active_features = self._encode_active_mon(battle.opponent_active_pokemon)
+            # One-hot typed active mon features (38 each)
+            active_features     = _encode_active_mon(battle.active_pokemon)
+            opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
+
             own_speed = np.float32([self._get_speed(battle.active_pokemon)])
             opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
             opp_move_eff = np.zeros(4, dtype=np.float32)
@@ -269,22 +275,45 @@ class InferenceAgent(Player):
                         opp_move_eff[i] = np.clip(eff - 1.0, -1.0, 1.0)
                     except Exception:
                         pass
-            opp_active_frozen = np.float32([1.0 if _is_frozen(battle.opponent_active_pokemon) else 0.0])
-            opp_active_paralyzed = np.float32([1.0 if _is_paralyzed(battle.opponent_active_pokemon) else 0.0])
-            own_atk_boost = np.float32([battle.active_pokemon.boosts.get("atk", 0) / 6.0 if battle.active_pokemon else 0.0])
-            own_spe_boost = np.float32([battle.active_pokemon.boosts.get("spa", 0) / 6.0 if battle.active_pokemon else 0.0])
+
+            # All boosts normalized to [-1, 1] via /6
+            own_boosts = _encode_boosts(battle.active_pokemon)           # [atk, def, spe, spa, spd]
+            opp_boosts = _encode_boosts(battle.opponent_active_pokemon)  # [atk, def, spe, spa, spd]
+
+            # Gen 2: held item IDs
+            own_item_id = np.float32([self._get_item_id(battle.active_pokemon)])
+            opp_item_id = np.float32([self._get_item_id(battle.opponent_active_pokemon)])
+
+            own_status_flags = _encode_status_flags(battle.active_pokemon)
+            opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
 
             return np.float32(np.concatenate([
-                moves_base_power, moves_dmg_multiplier, moves_pp_ratio,
-                self_team_status, opponent_team_status,
-                team_hp_ratio, opponent_hp_ratio,
-                team_identifier, opponent_identifier,
-                self_status, opponent_status,
-                special_case, active_features, opp_active_features,
-                own_speed, opp_speed, opp_move_eff,
-                opp_active_frozen, opp_active_paralyzed,
-                own_atk_boost, own_spe_boost,
+                moves_base_power,        # 4
+                moves_dmg_multiplier,    # 4
+                moves_pp_ratio,          # 4
+                self_team_status,        # 6
+                opponent_team_status,    # 6
+                team_hp_ratio,           # 6
+                opponent_hp_ratio,       # 6
+                team_identifier,         # 6
+                opponent_identifier,     # 6
+                self_status,             # 6
+                opponent_status,         # 6
+                special_case,            # 2
+                active_features,         # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
+                opp_active_features,     # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
+                own_speed,               # 1
+                opp_speed,               # 1
+                opp_move_eff,            # 4
+                own_boosts,              # 5   [atk, def, spe, spa, spd]
+                opp_boosts,              # 5   [atk, def, spe, spa, spd]
+                own_item_id,             # 1
+                opp_item_id,             # 1
+                own_status_flags,        # 5   [slp, frz, par, brn, psn]
+                opp_status_flags,        # 5   [slp, frz, par, brn, psn]
             ]))
+            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5 = 166
+
         except Exception:
             return np.zeros(OBS_SIZE, dtype=np.float32)
 
@@ -311,7 +340,6 @@ class InferenceAgent(Player):
         return action_mask
 
     def choose_move(self, battle):
-        """Sync — used by SingleAgentWrapper inside SB3 env loop."""
         obs = self._embed(battle)
         mask = self._build_mask(battle)
         action, _ = self._model.predict(obs[np.newaxis, :], action_masks=mask[np.newaxis, :], deterministic=True)
@@ -347,7 +375,7 @@ class AsyncInferenceAgent(InferenceAgent):
 # -----------------------------
 # Play vs Human
 # -----------------------------
-async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1):
+async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1, battle_format: str = "gen2randombattle"):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found!")
@@ -358,7 +386,7 @@ async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1
 
     agent = AsyncInferenceAgent(
         model=model,
-        battle_format="gen1randombattle",
+        battle_format=battle_format,
         account_configuration=AccountConfiguration("PokemonBot", None),
         server_configuration=LocalhostServerConfiguration,
         start_listening=True,
@@ -367,7 +395,7 @@ async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1
     print(f"[Human Mode] Bot logged in as 'PokemonBot' on localhost:8000")
     print(f"[Human Mode] Open http://localhost:8000 in your browser")
     print(f"[Human Mode] Log in as '{human_username}' and challenge 'PokemonBot'")
-    print(f"[Human Mode] Waiting for {n_battles} battle(s)...")
+    print(f"[Human Mode] Waiting for {n_battles} battle(s) in format '{battle_format}'...")
 
     await agent.accept_challenges(human_username, n_battles)
 
@@ -380,16 +408,7 @@ async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1
 # -----------------------------
 # League / Ladder Training
 # -----------------------------
-# Train LEARNER_NAME against a frozen OPPONENT_NAME.
-# The learner trains via SB3 (parallel envs supported).
-# The opponent is frozen — it only runs inference, never updates.
-#
-# Ladder usage:
-#   train_vs_opponent("Gen1", "ParallelTest8", 500_000)  # Gen1 starts from Test8 weights, trains vs frozen Test8
-#   train_vs_opponent("Gen2", "Gen1",          500_000)  # Gen2 learns vs frozen Gen1
-#   train_vs_opponent("Gen3", "Gen2",          500_000)  # and so on...
-# -----------------------------
-def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True):
+def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
     learner_path  = model_path(learner_name)
     opponent_path = model_path(opponent_name)
 
@@ -397,9 +416,8 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
         print(f"[League] Opponent model '{opponent_name}' not found!")
         return
 
-    print(f"[League] {learner_name} vs {opponent_name} | timesteps={timesteps:,} | n_envs={n_envs}")
+    print(f"[League] {learner_name} vs {opponent_name} | timesteps={timesteps:,} | n_envs={n_envs} | format={battle_format}")
 
-    # Load frozen opponent once — shared across all envs (inference only, no gradients)
     frozen_opponent_model = MaskablePPO.load(opponent_path, policy_kwargs=dict(net_arch=NET_ARCH))
 
     def make_league_env_fn(env_id: int, seed: int = 0):
@@ -410,7 +428,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
 
             env = CustomEnv(
-                battle_format="gen1randombattle",
+                battle_format=battle_format,
                 log_level=30,
                 open_timeout=None,
                 strict=False,
@@ -419,10 +437,9 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
                 server_configuration=LocalhostServerConfiguration,
             )
 
-            # Sync InferenceAgent — SingleAgentWrapper requires sync choose_move
             opponent = InferenceAgent(
                 model=frozen_opponent_model,
-                battle_format="gen1randombattle",
+                battle_format=battle_format,
                 account_configuration=opponent_config,
                 server_configuration=LocalhostServerConfiguration,
                 start_listening=False,
@@ -435,7 +452,6 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
     env_fns   = [make_league_env_fn(env_id=i, seed=42) for i in range(n_envs)]
     train_env = SubprocVecEnv(env_fns, start_method="spawn") if use_subproc and n_envs > 1 else DummyVecEnv(env_fns)
 
-    # Load existing learner checkpoint or create fresh
     if learner_path.exists():
         print(f"[League] Resuming {learner_name} from checkpoint")
         model = MaskablePPO.load(
