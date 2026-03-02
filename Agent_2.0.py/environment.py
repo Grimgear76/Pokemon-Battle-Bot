@@ -326,6 +326,7 @@ class CustomEnv(SinglesEnv):
         self._consec_wasted_moves: int = 0
         self._consec_wasted_switches: int = 0
         self._last_action_was_switch: bool = False
+        self._deadlock_turns: int = 0
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -419,6 +420,7 @@ class CustomEnv(SinglesEnv):
         self._consec_wasted_moves = 0
         self._consec_wasted_switches = 0
         self._last_action_was_switch = False
+        self._deadlock_turns = 0
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -476,6 +478,8 @@ class CustomEnv(SinglesEnv):
         if battle.turn <= 60:
             reward += 0.02 * opp_hp_lost
             reward -= 0.02 * my_hp_lost
+        
+
 
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp  = my_hp_now
@@ -486,8 +490,8 @@ class CustomEnv(SinglesEnv):
         # --- Per-turn stall penalty ---
         reward -= 0.001
 
-        # --- Ramping late-game penalty starting at turn 80 ---
-        # Grows linearly: turn 80 = 0, turn 130 = -0.01, capped at -0.01
+        # --- Ramping late-game penalty starting at turn 60 ---
+        # Grows linearly: turn 60 = 0, turn 110 = -0.01, capped at -0.1
         # Pushes the agent to close out games rather than stall indefinitely
         if battle.turn > 60:
             ramp = min((battle.turn - 60) * 0.002, 0.1)
@@ -496,14 +500,14 @@ class CustomEnv(SinglesEnv):
         # --- Switch penalty ---
         # Scales with team advantage: if agent has more alive mons than opponent,
         # switching without dealing damage is penalized much harder.
-        # Grace of 3 consecutive non-damaging switches before penalty kicks in.
+        # Grace of 1 consecutive non-damaging switch before penalty kicks in.
         if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
             self._consec_wasted_switches += 1
-            if self._consec_wasted_switches > 3:
+            if self._consec_wasted_switches > 1:
                 own_alive = sum(1 for m in battle.team.values() if not m.fainted)
                 opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
                 advantage = max(1.0, own_alive - opp_alive)  # 1x normal, up to 5x if 6v1
-                base_penalty = min(0.01 * (self._consec_wasted_switches - 3), 0.5)
+                base_penalty = min(0.1 * (self._consec_wasted_switches - 1), 1.0)
                 reward -= base_penalty * advantage
         else:
             self._consec_wasted_switches = 0
@@ -519,10 +523,27 @@ class CustomEnv(SinglesEnv):
         else:
             self._consec_wasted_moves = 0
 
-        # --- FIX 5: Hard penalty for completely neutral turns ---
-        # Catches infinite loops where nothing changes on either side
+        # --- Hard penalty for completely neutral turns / deadlock detection ---
+        # Catches infinite loops where nothing changes on either side.
+        # Escalates sharply after 5 consecutive dead turns to force a decision.
         if not opp_hp_actually_dropped and not my_hp_actually_dropped and not battle.force_switch:
+            self._deadlock_turns += 1
             reward -= 0.002
+            if self._deadlock_turns > 5:
+                reward -= 0.01 * (self._deadlock_turns - 5)
+        else:
+            self._deadlock_turns = 0
+
+        # --- Stat boost spam penalty ---
+        # Escalating penalty for stacking the same boost past +3.
+        # Discourages infinite Growth/Swords Dance/Agility loops mid-battle.
+        active = battle.active_pokemon
+        if active is not None and active.boosts:
+            boosts = active.boosts
+            for stat in ("spa", "spd", "atk", "def", "spe"):
+                val = boosts.get(stat, 0)
+                if val >= 3:
+                    reward -= 0.002 * (val - 2)
 
         return reward
 
@@ -648,7 +669,7 @@ class CustomEnv(SinglesEnv):
         super().close()
         print("[Environment Closed]")
 
-    # FIX 3: Explicit switch detection using range check
+    # Explicit switch detection using range check
     def step(self, action):
         if isinstance(action, dict):
             raw_action = next(iter(action.values()))
@@ -672,7 +693,6 @@ def _get_custom_env(env) -> Optional[CustomEnv]:
 
 # -----------------------------
 # Masking function
-# FIX 1: Illegal / pointless move masking
 # -----------------------------
 def mask_env(env):
     battle = env.env.battle1
@@ -697,6 +717,7 @@ def mask_env(env):
 
     own_mon = battle.active_pokemon
     own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
+    boosts = own_mon.boosts if own_mon.boosts is not None else {}
 
     # --- Build move mask with illegal/pointless move filtering ---
     if not battle.force_switch or not battle.active_pokemon.fainted:
@@ -710,11 +731,13 @@ def mask_env(env):
             if move.id == "sleeptalk" and not _is_asleep(own_mon):
                 allow = False
 
-            # Rest: blocked if already asleep or HP too high to matter
+            # Rest: blocked if already asleep, HP too high, or awake with no status condition
             if move.id == "rest":
                 if _is_asleep(own_mon):
                     allow = False
                 elif own_mon.max_hp > 0 and (own_mon.current_hp / own_mon.max_hp) > 0.8:
+                    allow = False
+                elif own_mon.status is None and own_mon.max_hp > 0 and (own_mon.current_hp / own_mon.max_hp) > 0.5:
                     allow = False
 
             # Other healing moves: block at high HP
@@ -728,18 +751,22 @@ def mask_env(env):
                     allow = False
 
             # Stat boost moves: block if the relevant stat is already maxed (+6)
-            # Prevents infinite Agility/Swords Dance/Growth spam at max boosts
-            if allow and move.base_power == 0 and own_mon.boosts:
-                boosts = own_mon.boosts
+            # Uses explicit None/falsy guard so the check always runs.
+            if allow and (move.base_power == 0 or move.base_power is None):
                 move_id = move.id
+
                 # Speed boosting moves
                 if move_id in ("agility", "rocksmash") and boosts.get("spe", 0) >= 6:
                     allow = False
                 # Attack boosting moves
                 elif move_id in ("swordsdance", "meditate", "sharpen") and boosts.get("atk", 0) >= 6:
                     allow = False
-                # Sp. Atk boosting moves
-                elif move_id in ("growth", "nastyplot", "chargebeam") and boosts.get("spa", 0) >= 6:
+                # Sp. Atk / Sp. Def boosting moves
+                # Growth raises both spa AND spd in Gen 2 — block only when BOTH are maxed
+                elif move_id == "growth" and boosts.get("spa", 0) >= 6 and boosts.get("spd", 0) >= 6:
+                    allow = False
+                # Other pure spa boosters
+                elif move_id in ("nastyplot", "chargebeam") and boosts.get("spa", 0) >= 6:
                     allow = False
                 # Defense boosting moves
                 elif move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:

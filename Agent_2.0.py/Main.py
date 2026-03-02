@@ -12,7 +12,7 @@ if __name__ == "__main__":
     # Modes: "new" | "continue" | "eval" | "human" | "league"
     MODE = "eval"
     MODEL_NAME     = "Mask1"
-    TRAINING_STEPS = 500000
+    TRAINING_STEPS = 100000
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6
@@ -28,8 +28,8 @@ if __name__ == "__main__":
     #   LEARNER_NAME = "Gen2"  |  OPPONENT_NAME = "ParallelTest8"
     #   next iteration
     #   LEARNER_NAME = "Gen3"  |  OPPONENT_NAME = "Gen2"
-    LEARNER_NAME  = "Test8Gen1"
-    OPPONENT_NAME = "ParallelTest8"
+    LEARNER_NAME  = "Mask1"
+    OPPONENT_NAME = "Mask1Gen2"
 
     # Derive battle format from GEN
     BATTLE_FORMAT = f"gen{GEN}randombattle"
