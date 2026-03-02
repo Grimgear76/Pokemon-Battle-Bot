@@ -287,6 +287,9 @@ class InferenceAgent(Player):
             own_status_flags = _encode_status_flags(battle.active_pokemon)
             opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
 
+            # Turn counter: normalized to [0, 1] over 150 turns, clamped at 1.0
+            turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
+
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
@@ -311,8 +314,9 @@ class InferenceAgent(Player):
                 opp_item_id,             # 1
                 own_status_flags,        # 5   [slp, frz, par, brn, psn]
                 opp_status_flags,        # 5   [slp, frz, par, brn, psn]
+                turn_counter,            # 1   normalized turn [0, 1]
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5 = 166
+            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1 = 167
 
         except Exception:
             return np.zeros(OBS_SIZE, dtype=np.float32)
