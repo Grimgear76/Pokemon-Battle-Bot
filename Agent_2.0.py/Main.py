@@ -11,8 +11,8 @@ if __name__ == "__main__":
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "human" | "league"
     MODE = "eval"
-    MODEL_NAME     = "ParallelTest13"
-    TRAINING_STEPS = 200000
+    MODEL_NAME     = "NoHp1"
+    TRAINING_STEPS = 500000
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6

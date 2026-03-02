@@ -470,10 +470,10 @@ class CustomEnv(SinglesEnv):
         opp_hp_lost = old_opp_hp - opp_hp_now
         my_hp_lost  = old_my_hp  - my_hp_now
 
-        if opp_hp_lost > 0.001:
-            reward += 0.002 * opp_hp_lost * 100
-        if my_hp_lost > 0.001:
-            reward -= 0.002 * my_hp_lost * 100
+        #if opp_hp_lost > 0.001:
+            #reward += 0.0025 * opp_hp_lost * 100
+        #if my_hp_lost > 0.001:
+            #reward -= 0.002 * my_hp_lost * 100
 
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp  = my_hp_now
@@ -489,7 +489,7 @@ class CustomEnv(SinglesEnv):
         if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
             self._consec_wasted_switches += 1
             if self._consec_wasted_switches > 3:
-                reward -= 0.01 * (self._consec_wasted_switches - 3)
+                reward -= 0.05 * (self._consec_wasted_switches - 3)
         else:
             self._consec_wasted_switches = 0
 
