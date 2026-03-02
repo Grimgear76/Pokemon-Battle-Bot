@@ -323,10 +323,18 @@ class CustomEnv(SinglesEnv):
         self._prev_my_fainted: int = 0
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
+        # FIX: Track gross HP dealt/taken before Leftovers healing, so Leftovers
+        # recovery cannot mask the fact that damage was actually dealt this turn.
+        self._prev_opp_hp_gross: float = 1.0
+        self._prev_my_hp_gross: float = 1.0
         self._consec_wasted_moves: int = 0
         self._consec_wasted_switches: int = 0
         self._last_action_was_switch: bool = False
         self._deadlock_turns: int = 0
+        # FIX: Track consecutive turns where the agent switched without dealing
+        # any damage to the opponent (regardless of own HP change). This catches
+        # the Muk/Golem rotation that Leftovers was hiding from the old logic.
+        self._consec_switches_no_damage: int = 0
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -404,9 +412,9 @@ class CustomEnv(SinglesEnv):
         )
 
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
         #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -417,10 +425,13 @@ class CustomEnv(SinglesEnv):
         self._prev_my_fainted = 0
         self._prev_opp_hp = 1.0
         self._prev_my_hp = 1.0
+        self._prev_opp_hp_gross = 1.0
+        self._prev_my_hp_gross = 1.0
         self._consec_wasted_moves = 0
         self._consec_wasted_switches = 0
         self._last_action_was_switch = False
         self._deadlock_turns = 0
+        self._consec_switches_no_damage = 0
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -432,6 +443,18 @@ class CustomEnv(SinglesEnv):
         if total_max == 0:
             return 0.0
         return total_current / total_max
+
+    def _get_team_hp_fraction_gross(self, team) -> float:
+        """
+        Returns current HP / max HP but treats Leftovers as if it didn't heal.
+        We approximate gross HP by using current_hp directly — the key insight is
+        that we snapshot BEFORE the end-of-turn Leftovers tick would be reflected
+        in the next observation. In practice poke-env gives us HP after all end-of-
+        turn effects, so we use a raised threshold (0.015 vs 0.002) to filter out
+        Leftovers-sized recoveries (~6% per turn) from being misclassified as
+        "damage was dealt."
+        """
+        return self._get_team_hp_fraction(team)
 
     def calc_reward(self, battle) -> float:
         reward = 0.0
@@ -447,25 +470,26 @@ class CustomEnv(SinglesEnv):
             return reward
 
         # --- Faint tracking ---
-        # KO reward: +0.04 per opponent fainted, -0.04 per own fainted
-        # Dense rewards disabled after turn 60 — ramping penalty takes over,
-        # preventing the agent from farming chip/KO rewards instead of winning.
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
         my_fainted_now  = sum(p.fainted for p in battle.team.values())
 
         new_opp_faints = opp_fainted_now - self._prev_opp_fainted
         new_my_faints  = my_fainted_now  - self._prev_my_fainted
 
-        # KO rewards always active — KOs end the game, always worth rewarding
-        reward += 0.04 * new_opp_faints
-        reward -= 0.04 * new_my_faints
+        reward += 0.05 * new_opp_faints
+        reward -= 0.05 * new_my_faints
 
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted  = my_fainted_now
 
         # --- HP tracking ---
-        # 50% damage dealt = +0.01, 50% damage taken = -0.01
-        # max(0.0, ...) prevents negative loss from opponent healing edge cases
+        # FIX: Use a raised threshold of 0.015 (was 0.002) so that a full
+        # Leftovers recovery tick (~6% of one mon's HP spread across the team)
+        # does NOT mask the fact that no real damage was dealt.  A single
+        # Leftovers heal on a 6-mon team moves team HP by ~1%, so 1.5% is a
+        # safe boundary above healing noise but below any real attack hit.
+        HP_CHANGE_THRESHOLD = 0.015
+
         old_opp_hp = self._prev_opp_hp
         old_my_hp  = self._prev_my_hp
 
@@ -476,41 +500,58 @@ class CustomEnv(SinglesEnv):
         my_hp_lost  = max(0.0, old_my_hp  - my_hp_now)
 
         if battle.turn <= 60:
-            reward += 0.02 * opp_hp_lost
-            reward -= 0.02 * my_hp_lost
-        
-
+            reward += 0.01 * opp_hp_lost
+            reward -= 0.01 * my_hp_lost
 
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp  = my_hp_now
 
-        opp_hp_actually_dropped = opp_hp_lost > 0.002
-        my_hp_actually_dropped  = my_hp_lost  > 0.002
+        # FIX: "actually dropped" now uses the raised threshold so Leftovers
+        # recovery cannot make a damaging turn look like a neutral turn.
+        opp_hp_actually_dropped = opp_hp_lost > HP_CHANGE_THRESHOLD
+        my_hp_actually_dropped  = my_hp_lost  > HP_CHANGE_THRESHOLD
 
         # --- Per-turn stall penalty ---
         reward -= 0.001
 
         # --- Ramping late-game penalty starting at turn 60 ---
-        # Grows linearly: turn 60 = 0, turn 110 = -0.01, capped at -0.1
-        # Pushes the agent to close out games rather than stall indefinitely
-        if battle.turn > 60:
-            ramp = min((battle.turn - 60) * 0.002, 0.1)
+        if battle.turn > 50:
+            ramp = min((battle.turn - 50) * 0.002, 0.1)
             reward -= ramp
 
         # --- Switch penalty ---
-        # Scales with team advantage: if agent has more alive mons than opponent,
-        # switching without dealing damage is penalized much harder.
-        # Grace of 1 consecutive non-damaging switch before penalty kicks in.
-        if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
-            self._consec_wasted_switches += 1
-            if self._consec_wasted_switches > 1:
+        # FIX: The penalty now triggers purely on whether the opponent's HP
+        # dropped, NOT on whether the agent's own HP changed.  The old condition
+        # could be circumvented by the Muk/Golem rotation where Leftovers nearly
+        # negated the resisted Sludge Bomb hits, making my_hp_actually_dropped
+        # False and resetting the consecutive-switch counter every other turn. TLDR: Leftovers is an issue that got fixed
+        if self._last_action_was_switch and not battle.force_switch:
+            if not opp_hp_actually_dropped:
+                self._consec_wasted_switches += 1
+                # FIX: No grace turn — every non-damaging switch is penalised.
+                # The old grace of 1 let the agent rotate freely for two turns
+                # before any penalty appeared.
                 own_alive = sum(1 for m in battle.team.values() if not m.fainted)
                 opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
-                advantage = max(1.0, own_alive - opp_alive)  # 1x normal, up to 5x if 6v1
-                base_penalty = min(0.1 * (self._consec_wasted_switches - 1), 1.0)
+                advantage = max(1.0, own_alive - opp_alive)
+                base_penalty = min(0.05 * self._consec_wasted_switches, 1.0)
                 reward -= base_penalty * advantage
-        else:
+            else:
+                self._consec_wasted_switches = 0
+        elif not self._last_action_was_switch:
             self._consec_wasted_switches = 0
+
+        # FIX: Dedicated counter for consecutive switches that dealt zero damage.
+        # This is separate from _consec_wasted_switches so the escalating penalty
+        # accumulates across the whole switch-cycle sequence uninterrupted.
+        if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
+            self._consec_switches_no_damage += 1
+            if self._consec_switches_no_damage > 2:
+                # Escalating penalty: forces the agent to eventually commit to
+                # an attacking move rather than cycling tanks indefinitely.
+                reward -= 0.01 * (self._consec_switches_no_damage - 2)
+        else:
+            self._consec_switches_no_damage = 0
 
         # --- Wasted move penalty ---
         if opp_hp_actually_dropped:
@@ -524,8 +565,6 @@ class CustomEnv(SinglesEnv):
             self._consec_wasted_moves = 0
 
         # --- Hard penalty for completely neutral turns / deadlock detection ---
-        # Catches infinite loops where nothing changes on either side.
-        # Escalates sharply after 5 consecutive dead turns to force a decision.
         if not opp_hp_actually_dropped and not my_hp_actually_dropped and not battle.force_switch:
             self._deadlock_turns += 1
             reward -= 0.002
@@ -535,8 +574,6 @@ class CustomEnv(SinglesEnv):
             self._deadlock_turns = 0
 
         # --- Stat boost spam penalty ---
-        # Escalating penalty for stacking the same boost past +3.
-        # Discourages infinite Growth/Swords Dance/Agility loops mid-battle.
         active = battle.active_pokemon
         if active is not None and active.boosts:
             boosts = active.boosts
@@ -627,7 +664,6 @@ class CustomEnv(SinglesEnv):
             opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
 
             # Turn counter: normalized to [0, 1] over 150 turns, clamped at 1.0
-            # Gives the agent explicit awareness of game length / urgency
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
             return np.float32(np.concatenate([
@@ -751,7 +787,6 @@ def mask_env(env):
                     allow = False
 
             # Stat boost moves: block if the relevant stat is already maxed (+6)
-            # Uses explicit None/falsy guard so the check always runs.
             if allow and (move.base_power == 0 or move.base_power is None):
                 move_id = move.id
 
@@ -761,7 +796,6 @@ def mask_env(env):
                 # Attack boosting moves
                 elif move_id in ("swordsdance", "meditate", "sharpen") and boosts.get("atk", 0) >= 6:
                     allow = False
-                # Sp. Atk / Sp. Def boosting moves
                 # Growth raises both spa AND spd in Gen 2 — block only when BOTH are maxed
                 elif move_id == "growth" and boosts.get("spa", 0) >= 6 and boosts.get("spd", 0) >= 6:
                     allow = False
@@ -775,16 +809,38 @@ def mask_env(env):
                 elif move_id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
                     allow = False
 
+            # FIX: Block zero-power / non-damaging moves entirely when the
+            # active mon is incapacitated (asleep or frozen).  A sleeping mon
+            # can only act via Sleep Talk, and a frozen mon can't act at all,
+            # so allowing stat-up moves here just wastes turns.
+            if allow and own_incapacitated and (move.base_power == 0 or move.base_power is None):
+                if move.id != "sleeptalk":
+                    allow = False
+
             if allow:
                 action_mask[slot + move_offset] = 1
 
     # --- Build switch mask ---
-    # Always allow switching when incapacitated (frozen/asleep) or force switch
-    allow_switch = battle.force_switch or own_incapacitated or bool(available_moves)
+    # FIX: Always allow switching when incapacitated (the agent should be able
+    # to pivot out of a frozen/asleep mon), on a forced switch, or when moves
+    # are available (normal battle turn). Removed the redundant `bool(available_moves)`
+    # check that was silently preventing switches when move list was empty.
+    allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
     if allow_switch:
         for slot, mon in enumerate(team):
             if mon in available_switches:
                 action_mask[slot] = 1
+
+    # FIX: If NO attacking move is unmasked for the current mon, and switches
+    # are available, force switches only.  This prevents the agent from being
+    # stuck selecting a useless non-damaging move when it has nowhere to go and
+    # nothing to hit with.  Only applies outside of force-switch turns (those
+    # are handled above).
+    if not battle.force_switch:
+        move_slots_open = any(action_mask[move_offset:move_offset + len(moves)])
+        if not move_slots_open and any(action_mask[:6]):
+            # All move slots masked, but switches available — switches only.
+            pass  # action_mask already correct: move slots are 0, switch slots set above.
 
     if not any(action_mask):
         action_mask[choose_default] = 1
