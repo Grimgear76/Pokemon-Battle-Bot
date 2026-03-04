@@ -145,13 +145,27 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
         for i, done in enumerate(dones):
             if done:
                 info = infos[i]
-                ep_reward = info.get("episode", {}).get("r", 0)
-                if ep_reward > 0.5:
-                    wins += 1
-                elif ep_reward < -0.5:
-                    losses += 1
+                # Use the clean terminal reward written by CustomEnv.step() so
+                # that accumulated shaping rewards cannot cause a lost battle
+                # (with positive shaping points) to be miscounted as a win.
+                terminal_reward = info.get("terminal_reward", None)
+                if terminal_reward is not None:
+                    if terminal_reward > 0.5:
+                        wins += 1
+                    elif terminal_reward < -0.5:
+                        losses += 1
+                    else:
+                        draws += 1
                 else:
-                    draws += 1
+                    # Fallback: should never happen in normal operation, but
+                    # guards against edge cases where the key is missing.
+                    ep_reward = info.get("episode", {}).get("r", 0)
+                    if ep_reward > 0.5:
+                        wins += 1
+                    elif ep_reward < -0.5:
+                        losses += 1
+                    else:
+                        draws += 1
                 battles_done += 1
                 pbar.update(1)
                 pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
@@ -163,7 +177,7 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
 
 
 # -----------------------------
-# Inference Agent (sync — works inside SB3 env loop)
+# Inference Agent (sync - works inside SB3 env loop)
 # -----------------------------
 class InferenceAgent(Player):
     def __init__(self, model, **kwargs):

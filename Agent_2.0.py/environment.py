@@ -179,7 +179,7 @@ def _encode_active_mon(mon) -> np.ndarray:
     """
     Returns a 38-element float32 array:
       [hp(1), status(1), type1_onehot(18), type2_onehot(18)]
-    type2 is all-zeros for mono-type Pokémon.
+    type2 is all-zeros for mono-type Pokemon.
     """
     hp = np.float32([-1.0 if (mon is None or mon.fainted or mon.max_hp == 0)
                      else (mon.current_hp / mon.max_hp) * 2 - 1])
@@ -196,12 +196,97 @@ def _encode_active_mon(mon) -> np.ndarray:
 from poke_env.player import Player
 
 class MaxDamagePlayer(Player):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.gen_data = GenData.from_gen(2)
+
+    def _is_move_useful(self, move, mon, battle) -> bool:
+        """
+        Returns False for moves that are obviously pointless to use right now,
+        mirroring the same logic used in mask_env for the agent.
+        """
+        boosts = mon.boosts if mon.boosts is not None else {}
+
+        # Rest: pointless if already asleep, or HP is too high and no status
+        if move.id == "rest":
+            if _is_asleep(mon):
+                return False
+            if mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.8:
+                return False
+            if mon.status is None and mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.5:
+                return False
+
+        # Sleep Talk: only useful while asleep
+        if move.id == "sleeptalk" and not _is_asleep(mon):
+            return False
+
+        # Other healing moves: pointless at high HP
+        if getattr(move, 'heal', 0) and move.id != "rest":
+            if mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.85:
+                return False
+
+        # Status-inflicting moves: pointless if opponent already has a status
+        if getattr(move, 'status', None) and battle.opponent_active_pokemon is not None:
+            if battle.opponent_active_pokemon.status is not None:
+                return False
+
+        # Stat boost moves: pointless if the relevant stat is already maxed
+        if move.base_power == 0 or move.base_power is None:
+            move_id = move.id
+            if move_id in ("agility", "rocksmash") and boosts.get("spe", 0) >= 6:
+                return False
+            if move_id in ("swordsdance", "meditate", "sharpen") and boosts.get("atk", 0) >= 6:
+                return False
+            if move_id == "growth" and boosts.get("spa", 0) >= 6 and boosts.get("spd", 0) >= 6:
+                return False
+            if move_id in ("nastyplot", "chargebeam") and boosts.get("spa", 0) >= 6:
+                return False
+            if move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:
+                return False
+            if move_id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
+                return False
+
+        return True
+
     def choose_move(self, battle):
-        if battle.available_moves:
-            best_move = max(battle.available_moves, key=lambda move: move.base_power)
+        mon = battle.active_pokemon
+
+        # Filter to only damaging moves first
+        damaging_moves = [m for m in battle.available_moves if m.base_power and m.base_power > 0]
+
+        if damaging_moves:
+            # Among damaging moves, pick highest effective power (base_power x type multiplier)
+            def effective_power(move):
+                if battle.opponent_active_pokemon is None:
+                    return move.base_power
+                try:
+                    mult = move.type.damage_multiplier(
+                        battle.opponent_active_pokemon.type_1,
+                        battle.opponent_active_pokemon.type_2,
+                        type_chart=self.gen_data.type_chart
+                    )
+                    return move.base_power * mult
+                except Exception:
+                    return move.base_power
+
+            best_move = max(damaging_moves, key=effective_power)
             return self.create_order(best_move)
-        else:
-            return self.choose_random_move(battle)
+
+        # No damaging moves — prefer switching over wasting a turn
+        if battle.available_switches:
+            return self.create_order(battle.available_switches[0])
+
+        # Filter status/utility moves to only ones that are actually useful right now
+        if mon is not None:
+            useful_moves = [
+                m for m in battle.available_moves
+                if self._is_move_useful(m, mon, battle)
+            ]
+            if useful_moves:
+                return self.create_order(useful_moves[0])
+
+        # Absolute last resort: random move to avoid forfeiting
+        return self.choose_random_move(battle)
 
 
 # -----------------------------
@@ -238,12 +323,24 @@ class ProgressCallback(BaseCallback):
         for done, info in zip(dones, infos):
             if done:
                 self.episode_count += 1
-                ep_info = info.get("episode", {})
-                reward = ep_info.get("r", 0)
-                if reward > 0.5:
-                    self.wins += 1
-                elif reward < -0.5:
-                    self.losses += 1
+                # Use the clean terminal reward written by CustomEnv.step() so
+                # that accumulated shaping rewards cannot cause a lost battle
+                # (with positive shaping points) to be miscounted as a win.
+                terminal_reward = info.get("terminal_reward", None)
+                if terminal_reward is not None:
+                    if terminal_reward > 0.5:
+                        self.wins += 1
+                    elif terminal_reward < -0.5:
+                        self.losses += 1
+                else:
+                    # Fallback: should never happen in normal operation, but
+                    # guards against edge cases where the key is missing.
+                    ep_info = info.get("episode", {})
+                    reward = ep_info.get("r", 0)
+                    if reward > 0.5:
+                        self.wins += 1
+                    elif reward < -0.5:
+                        self.losses += 1
         if self.episode_count > 0:
             wr = self.wins / self.episode_count
             self.pbar.set_postfix(
@@ -281,11 +378,11 @@ class EntropyMonitorCallback(BaseCallback):
         if actual_entropy < self.ENTROPY_THRESHOLD and not self._boosted:
             self.model.ent_coef = self.ENT_COEF_BOOST
             self._boosted = True
-            print(f"\n[EntropyMonitor] Entropy collapsed ({actual_entropy:.3f}). Boosting ent_coef → {self.ENT_COEF_BOOST}")
+            print(f"\n[EntropyMonitor] Entropy collapsed ({actual_entropy:.3f}). Boosting ent_coef -> {self.ENT_COEF_BOOST}")
         elif actual_entropy >= self.ENTROPY_THRESHOLD and self._boosted:
             self.model.ent_coef = self.ENT_COEF_NORMAL
             self._boosted = False
-            print(f"\n[EntropyMonitor] Entropy recovered ({actual_entropy:.3f}). Restoring ent_coef → {self.ENT_COEF_NORMAL}")
+            print(f"\n[EntropyMonitor] Entropy recovered ({actual_entropy:.3f}). Restoring ent_coef -> {self.ENT_COEF_NORMAL}")
 
     def _on_step(self) -> bool:
         return True
@@ -335,6 +432,7 @@ class CustomEnv(SinglesEnv):
         # any damage to the opponent (regardless of own HP change). This catches
         # the Muk/Golem rotation that Leftovers was hiding from the old logic.
         self._consec_switches_no_damage: int = 0
+        self._terminal_reward: Optional[float] = None
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -412,8 +510,8 @@ class CustomEnv(SinglesEnv):
         )
 
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
-        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
         #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -432,6 +530,7 @@ class CustomEnv(SinglesEnv):
         self._last_action_was_switch = False
         self._deadlock_turns = 0
         self._consec_switches_no_damage = 0
+        self._terminal_reward = None
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = 0.0
@@ -447,7 +546,7 @@ class CustomEnv(SinglesEnv):
     def _get_team_hp_fraction_gross(self, team) -> float:
         """
         Returns current HP / max HP but treats Leftovers as if it didn't heal.
-        We approximate gross HP by using current_hp directly — the key insight is
+        We approximate gross HP by using current_hp directly - the key insight is
         that we snapshot BEFORE the end-of-turn Leftovers tick would be reflected
         in the next observation. In practice poke-env gives us HP after all end-of-
         turn effects, so we use a raised threshold (0.015 vs 0.002) to filter out
@@ -461,13 +560,16 @@ class CustomEnv(SinglesEnv):
 
         if battle.finished:
             if battle.won is None:
-                reward = -0.5
+                terminal = -0.5
             elif battle.won:
-                reward = 1.0
+                terminal = 1.0
             else:
-                reward = -1.0
+                terminal = -1.0
+            # Store the terminal reward so step() can surface it in info.
+            # This is the clean win/loss signal, uncontaminated by shaping rewards.
+            self._terminal_reward = terminal
             self._reset_battle_tracking()
-            return reward
+            return terminal
 
         # --- Faint tracking ---
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
@@ -499,7 +601,7 @@ class CustomEnv(SinglesEnv):
         opp_hp_lost = max(0.0, old_opp_hp - opp_hp_now)
         my_hp_lost  = max(0.0, old_my_hp  - my_hp_now)
 
-        if battle.turn <= 60:
+        if battle.turn <= 50:
             reward += 0.01 * opp_hp_lost
             reward -= 0.01 * my_hp_lost
 
@@ -528,7 +630,7 @@ class CustomEnv(SinglesEnv):
         if self._last_action_was_switch and not battle.force_switch:
             if not opp_hp_actually_dropped:
                 self._consec_wasted_switches += 1
-                # FIX: No grace turn — every non-damaging switch is penalised.
+                # FIX: No grace turn - every non-damaging switch is penalised.
                 # The old grace of 1 let the agent rotate freely for two turns
                 # before any penalty appeared.
                 own_alive = sum(1 for m in battle.team.values() if not m.fainted)
@@ -712,7 +814,14 @@ class CustomEnv(SinglesEnv):
         else:
             raw_action = action
         self._last_action_was_switch = raw_action in range(0, 6)
-        return super().step(action)
+        self._terminal_reward = None  # Clear before each step
+        obs, reward, terminated, truncated, info = super().step(action)
+        # If the battle just ended, attach the clean terminal reward to info
+        # so ProgressCallback can read the true win/loss signal without it
+        # being polluted by accumulated shaping rewards in the episode sum.
+        if (terminated or truncated) and self._terminal_reward is not None:
+            info["terminal_reward"] = self._terminal_reward
+        return obs, reward, terminated, truncated, info
 
 
 # -----------------------------
@@ -796,7 +905,7 @@ def mask_env(env):
                 # Attack boosting moves
                 elif move_id in ("swordsdance", "meditate", "sharpen") and boosts.get("atk", 0) >= 6:
                     allow = False
-                # Growth raises both spa AND spd in Gen 2 — block only when BOTH are maxed
+                # Growth raises both spa AND spd in Gen 2 - block only when BOTH are maxed
                 elif move_id == "growth" and boosts.get("spa", 0) >= 6 and boosts.get("spd", 0) >= 6:
                     allow = False
                 # Other pure spa boosters
@@ -805,7 +914,7 @@ def mask_env(env):
                 # Defense boosting moves
                 elif move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:
                     allow = False
-                # Curse (raises atk+def, lowers spe) — block if both atk and def maxed
+                # Curse (raises atk+def, lowers spe) - block if both atk and def maxed
                 elif move_id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
                     allow = False
 
@@ -839,7 +948,7 @@ def mask_env(env):
     if not battle.force_switch:
         move_slots_open = any(action_mask[move_offset:move_offset + len(moves)])
         if not move_slots_open and any(action_mask[:6]):
-            # All move slots masked, but switches available — switches only.
+            # All move slots masked, but switches available - switches only.
             pass  # action_mask already correct: move slots are 0, switch slots set above.
 
     if not any(action_mask):
