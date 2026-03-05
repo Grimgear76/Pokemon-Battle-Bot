@@ -1,0 +1,9 @@
+tensorboard
+poke-env
+numpy
+torch
+gymnasium
+tqdm
+stable-baselines3
+sb3-contrib
+matplotlib
