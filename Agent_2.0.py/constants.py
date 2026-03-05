@@ -14,7 +14,7 @@ SERVER_CONFIG = LocalhostServerConfiguration
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-# OBS_SIZE breakdown (167 total):
+# OBS_SIZE breakdown (179 total):
 #   moves_base_power        4
 #   moves_dmg_multiplier    4
 #   moves_pp_ratio          4
@@ -39,7 +39,9 @@ MODEL_DIR.mkdir(exist_ok=True)
 #   own_status_flags        5   [slp, frz, par, brn, psn]
 #   opp_status_flags        5   [slp, frz, par, brn, psn]
 #   turn_counter            1   normalized turn number [0, 1] over 150 turns
-OBS_SIZE = 167
+#   opp_alive_flags         6   [1.0=alive, 0.0=fainted] for each of 6 opponent slots
+#   own_alive_flags         6   [1.0=alive, 0.0=fainted] for each of 6 own slots
+OBS_SIZE = 179
 
 ACTION_SPACE_SIZE = 11
 NET_ARCH = [512, 128, 64]

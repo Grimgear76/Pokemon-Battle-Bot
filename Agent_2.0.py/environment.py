@@ -191,6 +191,36 @@ def _encode_active_mon(mon) -> np.ndarray:
 
 
 # -----------------------------
+# Alive flags helpers
+# -----------------------------
+def _get_opp_alive_flags(battle) -> np.ndarray:
+    """
+    Returns 6 floats: 1.0 if pokemon in that slot is alive, 0.0 if fainted.
+    Unseen slots default to 1.0 (conservative — assume alive until proven otherwise).
+    """
+    flags = []
+    for mon in battle.opponent_team.values():
+        flags.append(0.0 if mon.fainted else 1.0)
+    # Pad unseen slots with 1.0 (unknown = assume alive)
+    while len(flags) < 6:
+        flags.append(1.0)
+    return np.float32(flags[:6])
+
+
+def _get_own_alive_flags(battle) -> np.ndarray:
+    """
+    Returns 6 floats: 1.0 if pokemon in that slot is alive, 0.0 if fainted.
+    Own team is always fully known so no unseen slots possible.
+    """
+    flags = []
+    for mon in battle.team.values():
+        flags.append(0.0 if mon.fainted else 1.0)
+    while len(flags) < 6:
+        flags.append(1.0)
+    return np.float32(flags[:6])
+
+
+# -----------------------------
 # Max Damage Player
 # -----------------------------
 from poke_env.player import Player
@@ -587,6 +617,7 @@ class CustomEnv(SinglesEnv):
         opp_hp_lost = max(0.0, old_opp_hp - opp_hp_now)
         my_hp_lost  = max(0.0, old_my_hp  - my_hp_now)
 
+        # --- HP difference reward (commented out) ---
         #if battle.turn <= 50:
         #    reward += 0.01 * opp_hp_lost
         #    reward -= 0.01 * my_hp_lost
@@ -763,6 +794,11 @@ class CustomEnv(SinglesEnv):
             # Turn counter: normalized to [0, 1] over 150 turns, clamped at 1.0
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
+            # Alive flags: 1.0=alive, 0.0=fainted for each of 6 slots
+            # opp unseen slots default to 1.0 (assume alive until proven otherwise)
+            opp_alive_flags = _get_opp_alive_flags(battle)  # 6
+            own_alive_flags = _get_own_alive_flags(battle)  # 6
+
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
@@ -788,8 +824,10 @@ class CustomEnv(SinglesEnv):
                 own_status_flags,        # 5   [slp, frz, par, brn, psn]
                 opp_status_flags,        # 5   [slp, frz, par, brn, psn]
                 turn_counter,            # 1   normalized turn [0, 1]
+                opp_alive_flags,         # 6   [1.0=alive, 0.0=fainted] opponent slots
+                own_alive_flags,         # 6   [1.0=alive, 0.0=fainted] own slots
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1 = 167
+            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1+6+6 = 179
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)

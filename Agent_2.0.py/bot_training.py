@@ -23,7 +23,8 @@ from constants import (
 from environment import (
     make_vec_env, ProgressCallback, EntropyMonitorCallback,
     CustomEnv, mask_env, _is_frozen, _is_paralyzed,
-    _encode_boosts, _encode_status_flags, _encode_active_mon
+    _encode_boosts, _encode_status_flags, _encode_active_mon,
+    _get_opp_alive_flags, _get_own_alive_flags,
 )
 
 
@@ -304,6 +305,11 @@ class InferenceAgent(Player):
             # Turn counter: normalized to [0, 1] over 150 turns, clamped at 1.0
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
+            # Alive flags: 1.0=alive, 0.0=fainted for each of 6 slots
+            # opp unseen slots default to 1.0 (assume alive until proven otherwise)
+            opp_alive_flags = _get_opp_alive_flags(battle)  # 6
+            own_alive_flags = _get_own_alive_flags(battle)  # 6
+
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
@@ -329,8 +335,10 @@ class InferenceAgent(Player):
                 own_status_flags,        # 5   [slp, frz, par, brn, psn]
                 opp_status_flags,        # 5   [slp, frz, par, brn, psn]
                 turn_counter,            # 1   normalized turn [0, 1]
+                opp_alive_flags,         # 6   [1.0=alive, 0.0=fainted] opponent slots
+                own_alive_flags,         # 6   [1.0=alive, 0.0=fainted] own slots
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1 = 167
+            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1+6+6 = 179
 
         except Exception:
             return np.zeros(OBS_SIZE, dtype=np.float32)
