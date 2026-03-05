@@ -508,9 +508,9 @@ class CustomEnv(SinglesEnv):
         )
 
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
         #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -587,9 +587,9 @@ class CustomEnv(SinglesEnv):
         opp_hp_lost = max(0.0, old_opp_hp - opp_hp_now)
         my_hp_lost  = max(0.0, old_my_hp  - my_hp_now)
 
-        if battle.turn <= 50:
-            reward += 0.01 * opp_hp_lost
-            reward -= 0.01 * my_hp_lost
+        #if battle.turn <= 50:
+        #    reward += 0.01 * opp_hp_lost
+        #    reward -= 0.01 * my_hp_lost
 
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp  = my_hp_now
@@ -645,12 +645,12 @@ class CustomEnv(SinglesEnv):
         else:
             self._consec_switches_no_damage = 0
 
-        # --- Wasted move penalty (grace: 1) ---
+        # --- Wasted move penalty (grace: 2) ---
         if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
         elif not my_hp_actually_dropped and not battle.force_switch:
             self._consec_wasted_moves += 1
-            if self._consec_wasted_moves > 1:
+            if self._consec_wasted_moves > 2:
                 penalty = 0.01 * (self._consec_wasted_moves - 1)
                 reward -= min(penalty, 0.5)
         else:
@@ -665,13 +665,13 @@ class CustomEnv(SinglesEnv):
         else:
             self._deadlock_turns = 0
 
-        # --- Stat boost spam penalty (threshold: >= 2) ---
+        # --- Stat boost spam penalty (threshold: >= 3) ---
         active = battle.active_pokemon
         if active is not None and active.boosts:
             boosts = active.boosts
             for stat in ("spa", "spd", "atk", "def", "spe"):
                 val = boosts.get(stat, 0)
-                if val >= 2:
+                if val >= 3:
                     reward -= 0.002 * (val - 1)
 
         # --- Speed bonus for finishing quickly ---
