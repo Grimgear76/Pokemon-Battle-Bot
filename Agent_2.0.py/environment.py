@@ -333,8 +333,6 @@ class ProgressCallback(BaseCallback):
                     elif terminal_reward < -0.5:
                         self.losses += 1
                 else:
-                    # Fallback: should never happen in normal operation, but
-                    # guards against edge cases where the key is missing.
                     ep_info = info.get("episode", {})
                     reward = ep_info.get("r", 0)
                     if reward > 0.5:
@@ -420,18 +418,18 @@ class CustomEnv(SinglesEnv):
         self._prev_my_fainted: int = 0
         self._prev_opp_hp: float = 1.0
         self._prev_my_hp: float = 1.0
-        # FIX: Track gross HP dealt/taken before Leftovers healing, so Leftovers
-        # recovery cannot mask the fact that damage was actually dealt this turn.
         self._prev_opp_hp_gross: float = 1.0
         self._prev_my_hp_gross: float = 1.0
         self._consec_wasted_moves: int = 0
         self._consec_wasted_switches: int = 0
         self._last_action_was_switch: bool = False
         self._deadlock_turns: int = 0
-        # FIX: Track consecutive turns where the agent switched without dealing
-        # any damage to the opponent (regardless of own HP change). This catches
-        # the Muk/Golem rotation that Leftovers was hiding from the old logic.
         self._consec_switches_no_damage: int = 0
+        # FIX: Global (non-resetting) counter for switches that dealt zero damage.
+        # Unlike _consec_wasted_switches, this does NOT reset when the agent
+        # rotates to a different Pokemon, so the agent cannot escape the penalty
+        # by cycling through its whole team.
+        self._total_switches_no_kill: int = 0
         self._terminal_reward: Optional[float] = None
 
     def action_to_order(self, action, battle, fake=False, strict=True):
@@ -511,8 +509,8 @@ class CustomEnv(SinglesEnv):
 
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
         #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
         #----------------------------------------------------------------------------------------------------------------------------------------------------------
 
         base_env = SingleAgentWrapper(env, opponent)
@@ -530,6 +528,7 @@ class CustomEnv(SinglesEnv):
         self._last_action_was_switch = False
         self._deadlock_turns = 0
         self._consec_switches_no_damage = 0
+        self._total_switches_no_kill = 0
         self._terminal_reward = None
 
     def _get_team_hp_fraction(self, team) -> float:
@@ -544,15 +543,6 @@ class CustomEnv(SinglesEnv):
         return total_current / total_max
 
     def _get_team_hp_fraction_gross(self, team) -> float:
-        """
-        Returns current HP / max HP but treats Leftovers as if it didn't heal.
-        We approximate gross HP by using current_hp directly - the key insight is
-        that we snapshot BEFORE the end-of-turn Leftovers tick would be reflected
-        in the next observation. In practice poke-env gives us HP after all end-of-
-        turn effects, so we use a raised threshold (0.015 vs 0.002) to filter out
-        Leftovers-sized recoveries (~6% per turn) from being misclassified as
-        "damage was dealt."
-        """
         return self._get_team_hp_fraction(team)
 
     def calc_reward(self, battle) -> float:
@@ -566,7 +556,6 @@ class CustomEnv(SinglesEnv):
             else:
                 terminal = -1.0
             # Store the terminal reward so step() can surface it in info.
-            # This is the clean win/loss signal, uncontaminated by shaping rewards.
             self._terminal_reward = terminal
             self._reset_battle_tracking()
             return terminal
@@ -585,11 +574,8 @@ class CustomEnv(SinglesEnv):
         self._prev_my_fainted  = my_fainted_now
 
         # --- HP tracking ---
-        # FIX: Use a raised threshold of 0.015 (was 0.002) so that a full
-        # Leftovers recovery tick (~6% of one mon's HP spread across the team)
-        # does NOT mask the fact that no real damage was dealt.  A single
-        # Leftovers heal on a 6-mon team moves team HP by ~1%, so 1.5% is a
-        # safe boundary above healing noise but below any real attack hit.
+        # Raised threshold so a full Leftovers tick (~1% of team HP) is not
+        # mistaken for real damage being dealt.
         HP_CHANGE_THRESHOLD = 0.015
 
         old_opp_hp = self._prev_opp_hp
@@ -608,31 +594,22 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_hp = opp_hp_now
         self._prev_my_hp  = my_hp_now
 
-        # FIX: "actually dropped" now uses the raised threshold so Leftovers
-        # recovery cannot make a damaging turn look like a neutral turn.
         opp_hp_actually_dropped = opp_hp_lost > HP_CHANGE_THRESHOLD
         my_hp_actually_dropped  = my_hp_lost  > HP_CHANGE_THRESHOLD
 
         # --- Per-turn stall penalty ---
-        reward -= 0.001
+        reward -= 0.002
 
-        # --- Ramping late-game penalty starting at turn 60 ---
-        if battle.turn > 50:
-            ramp = min((battle.turn - 50) * 0.002, 0.1)
+        # --- Ramping late-game penalty starting at turn 40 ---
+        if battle.turn > 40:
+            ramp = min((battle.turn - 40) * 0.005, 0.3)
             reward -= ramp
 
-        # --- Switch penalty ---
-        # FIX: The penalty now triggers purely on whether the opponent's HP
-        # dropped, NOT on whether the agent's own HP changed.  The old condition
-        # could be circumvented by the Muk/Golem rotation where Leftovers nearly
-        # negated the resisted Sludge Bomb hits, making my_hp_actually_dropped
-        # False and resetting the consecutive-switch counter every other turn. TLDR: Leftovers is an issue that got fixed
+        # --- Switch penalty (consecutive, resets on damage) ---
+        # Catches simple repeated switching back and forth.
         if self._last_action_was_switch and not battle.force_switch:
             if not opp_hp_actually_dropped:
                 self._consec_wasted_switches += 1
-                # FIX: No grace turn - every non-damaging switch is penalised.
-                # The old grace of 1 let the agent rotate freely for two turns
-                # before any penalty appeared.
                 own_alive = sum(1 for m in battle.team.values() if not m.fainted)
                 opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
                 advantage = max(1.0, own_alive - opp_alive)
@@ -643,46 +620,64 @@ class CustomEnv(SinglesEnv):
         elif not self._last_action_was_switch:
             self._consec_wasted_switches = 0
 
-        # FIX: Dedicated counter for consecutive switches that dealt zero damage.
-        # This is separate from _consec_wasted_switches so the escalating penalty
-        # accumulates across the whole switch-cycle sequence uninterrupted.
+        # --- Global rotation-switch penalty ---
+        # FIX: This counter does NOT reset when the agent switches to a
+        # different Pokemon, so cycling through the whole team to avoid
+        # the consecutive counter is penalised just as harshly.
+        # It decrements slightly when damage is actually dealt as a reward
+        # for eventually committing, but never drops below zero.
+        if self._last_action_was_switch and not battle.force_switch:
+            if not opp_hp_actually_dropped:
+                self._total_switches_no_kill += 1
+                reward -= min(0.02 * self._total_switches_no_kill, 0.5)
+            else:
+                # Dealt damage after switching — ease off but don't fully reset
+                self._total_switches_no_kill = max(0, self._total_switches_no_kill - 1)
+        else:
+            if opp_hp_actually_dropped:
+                self._total_switches_no_kill = max(0, self._total_switches_no_kill - 2)
+
+        # --- consec-switch-no-damage counter ---
         if self._last_action_was_switch and not battle.force_switch and not opp_hp_actually_dropped:
             self._consec_switches_no_damage += 1
             if self._consec_switches_no_damage > 2:
-                # Escalating penalty: forces the agent to eventually commit to
-                # an attacking move rather than cycling tanks indefinitely.
                 reward -= 0.01 * (self._consec_switches_no_damage - 2)
         else:
             self._consec_switches_no_damage = 0
 
-        # --- Wasted move penalty ---
+        # --- Wasted move penalty (grace: 1) ---
         if opp_hp_actually_dropped:
             self._consec_wasted_moves = 0
         elif not my_hp_actually_dropped and not battle.force_switch:
             self._consec_wasted_moves += 1
-            if self._consec_wasted_moves > 3:
-                penalty = 0.005 * (self._consec_wasted_moves - 3)
-                reward -= min(penalty, 0.3)
+            if self._consec_wasted_moves > 1:
+                penalty = 0.01 * (self._consec_wasted_moves - 1)
+                reward -= min(penalty, 0.5)
         else:
             self._consec_wasted_moves = 0
 
-        # --- Hard penalty for completely neutral turns / deadlock detection ---
+        # --- penalty for completely neutral turns / deadlock detection (grace: 1) ---
         if not opp_hp_actually_dropped and not my_hp_actually_dropped and not battle.force_switch:
             self._deadlock_turns += 1
-            reward -= 0.002
-            if self._deadlock_turns > 5:
-                reward -= 0.01 * (self._deadlock_turns - 5)
+            reward -= 0.005
+            if self._deadlock_turns > 3:
+                reward -= 0.02 * (self._deadlock_turns - 3)
         else:
             self._deadlock_turns = 0
 
-        # --- Stat boost spam penalty ---
+        # --- Stat boost spam penalty (threshold: >= 2) ---
         active = battle.active_pokemon
         if active is not None and active.boosts:
             boosts = active.boosts
             for stat in ("spa", "spd", "atk", "def", "spe"):
                 val = boosts.get(stat, 0)
-                if val >= 3:
-                    reward -= 0.002 * (val - 2)
+                if val >= 2:
+                    reward -= 0.002 * (val - 1)
+
+        # --- Speed bonus for finishing quickly ---
+        if battle.finished and battle.won:
+            speed_bonus = max(0.0, (80 - battle.turn) / 80) * 0.5
+            reward += speed_bonus
 
         return reward
 
@@ -864,6 +859,9 @@ def mask_env(env):
     own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
     boosts = own_mon.boosts if own_mon.boosts is not None else {}
 
+    # Opponent remaining Pokemon count — used for Whirlwind/phazing check
+    opp_remaining = sum(1 for m in battle.opponent_team.values() if not m.fainted)
+
     # --- Build move mask with illegal/pointless move filtering ---
     if not battle.force_switch or not battle.active_pokemon.fainted:
         for slot, move in enumerate(moves):
@@ -895,6 +893,12 @@ def mask_env(env):
                 if battle.opponent_active_pokemon.status is not None:
                     allow = False
 
+            # FIX: Whirlwind always fails when the opponent has only one Pokemon
+            # remaining (nothing left to drag in). Mask it to prevent the agent
+            # from wasting turns on a guaranteed-fail move.
+            if allow and move.id == "whirlwind" and opp_remaining <= 1:
+                allow = False
+
             # Stat boost moves: block if the relevant stat is already maxed (+6)
             if allow and (move.base_power == 0 or move.base_power is None):
                 move_id = move.id
@@ -919,7 +923,7 @@ def mask_env(env):
                     allow = False
 
             # FIX: Block zero-power / non-damaging moves entirely when the
-            # active mon is incapacitated (asleep or frozen).  A sleeping mon
+            # active mon is incapacitated (asleep or frozen). A sleeping mon
             # can only act via Sleep Talk, and a frozen mon can't act at all,
             # so allowing stat-up moves here just wastes turns.
             if allow and own_incapacitated and (move.base_power == 0 or move.base_power is None):
@@ -930,26 +934,19 @@ def mask_env(env):
                 action_mask[slot + move_offset] = 1
 
     # --- Build switch mask ---
-    # FIX: Always allow switching when incapacitated (the agent should be able
-    # to pivot out of a frozen/asleep mon), on a forced switch, or when moves
-    # are available (normal battle turn). Removed the redundant `bool(available_moves)`
-    # check that was silently preventing switches when move list was empty.
+    # Always allow switching when incapacitated, on a forced switch, or when
+    # moves are available (normal battle turn).
     allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
     if allow_switch:
         for slot, mon in enumerate(team):
             if mon in available_switches:
                 action_mask[slot] = 1
 
-    # FIX: If NO attacking move is unmasked for the current mon, and switches
-    # are available, force switches only.  This prevents the agent from being
-    # stuck selecting a useless non-damaging move when it has nowhere to go and
-    # nothing to hit with.  Only applies outside of force-switch turns (those
-    # are handled above).
     if not battle.force_switch:
         move_slots_open = any(action_mask[move_offset:move_offset + len(moves)])
         if not move_slots_open and any(action_mask[:6]):
-            # All move slots masked, but switches available - switches only.
-            pass  # action_mask already correct: move slots are 0, switch slots set above.
+            # All move slots masked, but switches available — switches only.
+            pass  # action_mask already correct
 
     if not any(action_mask):
         action_mask[choose_default] = 1

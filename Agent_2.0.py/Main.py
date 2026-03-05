@@ -10,15 +10,15 @@ if __name__ == "__main__":
     # Configuration
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "human" | "league"
-    MODE = "continue"
+    MODE = "league"
     MODEL_NAME     = "Agent1"
-    TRAINING_STEPS = 300000
+    TRAINING_STEPS = 100000
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
-    N_ENVS_RUN  = 6
+    N_ENVS_RUN  = 2
     USE_SUBPROC = True
 
-    # Human mode
+    # Human mode    
     HUMAN_USERNAME  = "Grimgear76"
     N_HUMAN_BATTLES = 3
 
@@ -28,8 +28,8 @@ if __name__ == "__main__":
     #   LEARNER_NAME = "Gen2"  |  OPPONENT_NAME = "ParallelTest8"
     #   next iteration
     #   LEARNER_NAME = "Gen3"  |  OPPONENT_NAME = "Gen2"
-    LEARNER_NAME  = "Agent1"
-    OPPONENT_NAME = "Mask1"
+    LEARNER_NAME  = "Agent1gen2"
+    OPPONENT_NAME = "Agent1"
 
     # Derive battle format from GEN
     BATTLE_FORMAT = f"gen{GEN}randombattle"
