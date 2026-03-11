@@ -276,6 +276,9 @@ class ProgressCallback(BaseCallback):
         self.episode_count = 0
         self.wins = 0
         self.losses = 0
+        self._custom_envs = []   # populated on training start
+        self._prev_w = []
+        self._prev_l = []
 
     def _on_training_start(self):
         self.pbar = tqdm(total=self.total_timesteps, desc="Training", unit="steps", dynamic_ncols=True)
@@ -285,29 +288,55 @@ class ProgressCallback(BaseCallback):
             f"n_envs={self.n_envs} | "
             f"effective_batch={N_STEPS * self.n_envs:,}"
         )
+        # Try to unwrap each env to get CustomEnv direct counter access.
+        # Only works with DummyVecEnv — SubprocVecEnv runs envs in separate
+        # processes so Python objects are inaccessible. Falls back to
+        # episode.r in _on_step when _custom_envs is empty.
+        self._custom_envs = []
+        self._use_counters = False
+        try:
+            for env in self.training_env.envs:
+                inner = env
+                while inner is not None:
+                    if hasattr(inner, 'eval_wins'):
+                        self._custom_envs.append(inner)
+                        break
+                    inner = getattr(inner, 'env', None)
+                else:
+                    self._custom_envs.append(None)
+            self._use_counters = any(c is not None for c in self._custom_envs)
+        except AttributeError:
+            pass  # SubprocVecEnv — no .envs attribute
+        self._prev_w = [c.eval_wins   if c else 0 for c in self._custom_envs]
+        self._prev_l = [c.eval_losses if c else 0 for c in self._custom_envs]
 
     def _on_step(self) -> bool:
         self.pbar.update(self.n_envs)
         dones = self.locals.get("dones", [])
         infos = self.locals.get("infos", [])
-        for done, info in zip(dones, infos):
+        for i, done in enumerate(dones):
             if done:
                 self.episode_count += 1
-                win_status = info.get("battle_won", None)
-                if win_status is True:
-                    self.wins += 1
-                elif win_status is False:
-                    self.losses += 1
+                if self._use_counters:
+                    # DummyVecEnv path — read ground-truth counters directly
+                    self.wins = sum(
+                        (self._custom_envs[j].eval_wins   - self._prev_w[j])
+                        for j in range(len(self._custom_envs)) if self._custom_envs[j]
+                    )
+                    self.losses = sum(
+                        (self._custom_envs[j].eval_losses - self._prev_l[j])
+                        for j in range(len(self._custom_envs)) if self._custom_envs[j]
+                    )
                 else:
-                    terminal_reward = info.get("terminal_reward", None)
-                    if terminal_reward is not None:
-                        if terminal_reward > 0.5:   self.wins += 1
-                        elif terminal_reward < -0.5: self.losses += 1
-                    else:
-                        ep_info = info.get("episode", {})
-                        reward = ep_info.get("r", 0)
-                        if reward > 0.5:   self.wins += 1
-                        elif reward < -0.5: self.losses += 1
+                    # SubprocVecEnv fallback — episode.r is the only signal
+                    # available across process boundaries. Use a wide threshold
+                    # to reduce miscounts from shaped reward accumulation.
+                    info = infos[i] if i < len(infos) else {}
+                    ep_reward = info.get("episode", {}).get("r", 0)
+                    if ep_reward > 2.0:
+                        self.wins += 1
+                    elif ep_reward < -2.0:
+                        self.losses += 1
         if self.episode_count > 0:
             wr = self.wins / self.episode_count
             self.pbar.set_postfix(battles=self.episode_count, W=self.wins, L=self.losses, WR=f"{wr:.1%}", refresh=False)
@@ -373,12 +402,9 @@ class CustomEnv(SinglesEnv):
 
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
-        self._consec_wasted_moves: int = 0
         self._consec_wasted_switches: int = 0
         self._last_action_was_switch: bool = False
         self._deadlock_turns: int = 0
-        self._consec_switches_no_damage: int = 0
-        self._total_switches_no_kill: int = 0
         self._terminal_reward: Optional[float] = None
         self._battle_won: Optional[bool] = None
 
@@ -456,12 +482,9 @@ class CustomEnv(SinglesEnv):
     def _reset_battle_tracking(self):
         self._prev_opp_fainted = 0
         self._prev_my_fainted = 0
-        self._consec_wasted_moves = 0
         self._consec_wasted_switches = 0
         self._last_action_was_switch = False
         self._deadlock_turns = 0
-        self._consec_switches_no_damage = 0
-        self._total_switches_no_kill = 0
         self._terminal_reward = None
         self._battle_won = None
         # NOTE: last_battle_won is intentionally NOT reset here.
@@ -486,11 +509,20 @@ class CustomEnv(SinglesEnv):
         reward = 0.0
 
         if battle.finished:
-            if battle.won is None:   terminal = -0.5
-            elif battle.won:         terminal = 1.0
-            else:                    terminal = -1.0
+            if battle.won is None:
+                terminal = -0.5
+            elif battle.won:
+                terminal = 1.0
+            else:
+                terminal = -1.0
+
+            # --- Faster win bonus ---
+            if battle.won:
+                terminal += max(0.0, (80 - battle.turn) / 80) * 0.3
+
             self._terminal_reward = terminal
             self._battle_won = battle.won
+
             # Only count agent1's battle (not agent2/opponent side)
             if battle is self.battle1:
                 if battle.won is True:
@@ -499,93 +531,76 @@ class CustomEnv(SinglesEnv):
                     self.eval_losses += 1
                 else:
                     self.eval_draws += 1
+
             self._reset_battle_tracking()
             return terminal
 
+        # --- KO delta ---
         opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
         my_fainted_now  = sum(p.fainted for p in battle.team.values())
-        reward += 0.05 * (opp_fainted_now - self._prev_opp_fainted)
-        reward -= 0.05 * (my_fainted_now  - self._prev_my_fainted)
+        reward += 0.08 * (opp_fainted_now - self._prev_opp_fainted)
+        reward -= 0.08 * (my_fainted_now  - self._prev_my_fainted)
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted  = my_fainted_now
 
+        # --- HP damage delta ---
         HP_CHANGE_THRESHOLD = 0.015
         opp_active = battle.opponent_active_pokemon
         own_active  = battle.active_pokemon
         opp_species = opp_active.species if opp_active else None
         own_species  = own_active.species  if own_active  else None
-        opp_hp_now = (opp_active.current_hp / opp_active.max_hp if opp_active and not opp_active.fainted and opp_active.max_hp > 0 else 0.0)
-        own_hp_now  = (own_active.current_hp  / own_active.max_hp  if own_active  and not own_active.fainted  and own_active.max_hp  > 0 else 0.0)
+        opp_hp_now = (opp_active.current_hp / opp_active.max_hp
+                      if opp_active and not opp_active.fainted and opp_active.max_hp > 0 else 0.0)
+        own_hp_now  = (own_active.current_hp  / own_active.max_hp
+                       if own_active  and not own_active.fainted  and own_active.max_hp  > 0 else 0.0)
 
         if opp_species == self._prev_active_opp_species and self._prev_active_opp_species is not None:
             opp_hp_lost = max(0.0, self._prev_active_opp_hp - opp_hp_now)
             opp_hp_actually_dropped = opp_hp_lost > HP_CHANGE_THRESHOLD
-            reward += 0.02 * opp_hp_lost
+            reward += 0.015 * opp_hp_lost
         else:
-            opp_hp_lost = 0.0; opp_hp_actually_dropped = False
+            opp_hp_lost = 0.0
+            opp_hp_actually_dropped = False
 
         if own_species == self._prev_active_own_species and self._prev_active_own_species is not None:
             own_hp_lost = max(0.0, self._prev_active_own_hp - own_hp_now)
             own_hp_actually_dropped = own_hp_lost > HP_CHANGE_THRESHOLD
-            reward -= 0.02 * own_hp_lost
+            reward -= 0.01 * own_hp_lost
         else:
-            own_hp_lost = 0.0; own_hp_actually_dropped = False
+            own_hp_lost = 0.0
+            own_hp_actually_dropped = False
 
         self._prev_active_opp_species = opp_species
         self._prev_active_own_species  = own_species
         self._prev_active_opp_hp      = opp_hp_now
         self._prev_active_own_hp       = own_hp_now
 
-        reward -= 0.001
-        if battle.turn > 40:
-            reward -= min((battle.turn - 40) * 0.005, 0.2)
+        # --- Small flat time penalty ---
+        reward -= 0.003
 
-        if self._last_action_was_switch and not battle.force_switch:
-            if not opp_hp_actually_dropped:
-                self._consec_wasted_switches += 1
-                own_alive = sum(1 for m in battle.team.values() if not m.fainted)
-                opp_alive = sum(1 for m in battle.opponent_team.values() if not m.fainted)
-                reward -= min(0.04 * self._consec_wasted_switches, .2) * max(1.0, own_alive - opp_alive)
-            else:
-                self._consec_wasted_switches = 0
-        elif not self._last_action_was_switch:
-            self._consec_wasted_switches = 0
+        # --- Late-game time pressure (one-time value per turn, not additive) ---
+        # Maximum contribution: -0.2/turn regardless of how long battle runs
+        if battle.turn > 20:
+            reward -= min((battle.turn - 20) * 0.02, 0.5)
 
-        if self._last_action_was_switch and not battle.force_switch:
-            if not opp_hp_actually_dropped:
-                self._total_switches_no_kill += 1
-                reward -= min(0.02 * self._total_switches_no_kill, 0.2)
-            else:
-                self._total_switches_no_kill = max(0, self._total_switches_no_kill - 1)
-        else:
-            if opp_hp_actually_dropped:
-                self._total_switches_no_kill = max(0, self._total_switches_no_kill - 2)
-
-        if opp_hp_actually_dropped:
-            self._consec_wasted_moves = 0
-        elif not own_hp_actually_dropped and not battle.force_switch:
-            self._consec_wasted_moves += 1
-            if self._consec_wasted_moves > 2:
-                reward -= min(0.01 * (self._consec_wasted_moves - 1), 0.5)
-        else:
-            self._consec_wasted_moves = 0
-
+        # --- Deadlock penalty (single counter, capped) ---
         if not opp_hp_actually_dropped and not own_hp_actually_dropped and not battle.force_switch:
             self._deadlock_turns += 1
-            reward -= 0.005
-            if self._deadlock_turns > 3:
-                reward -= 0.02 * (self._deadlock_turns - 3)
+            if self._deadlock_turns > 5:
+                reward -= min(0.005 * (self._deadlock_turns - 5), 0.05)
         else:
             self._deadlock_turns = 0
 
-        active = battle.active_pokemon
-        if active is not None and active.boosts:
-            for stat in ("spa", "spd", "atk", "def", "spe"):
-                val = active.boosts.get(stat, 0)
-                if val >= 3: reward -= 0.002 * (val - 1)
-
-        if battle.finished and battle.won:
-            reward += max(0.0, (80 - battle.turn) / 80) * 0.5
+        # --- Switch penalty (only for clearly wasted switches) ---
+        if self._last_action_was_switch and not battle.force_switch:
+            if not opp_hp_actually_dropped:
+                self._consec_wasted_switches += 1
+                if self._consec_wasted_switches > 2:
+                    reward -= min(0.02 * (self._consec_wasted_switches - 2), 0.06)
+            else:
+                self._consec_wasted_switches = 0
+        else:
+            self._consec_wasted_switches = 0
 
         return reward
 
