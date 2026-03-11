@@ -134,6 +134,21 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
     obs = eval_env.reset()
     battles_done = 0
 
+    # Get reference to CustomEnv for direct counter access
+    def get_custom_env(vec_env, i=0):
+        inner = vec_env.envs[i]
+        while inner is not None:
+            if hasattr(inner, 'eval_wins'):
+                return inner
+            inner = getattr(inner, 'env', None)
+        return None
+
+    custom_env = get_custom_env(eval_env)
+    # Snapshot counters before we start (in case env was reused)
+    prev_w = custom_env.eval_wins if custom_env else 0
+    prev_l = custom_env.eval_losses if custom_env else 0
+    prev_d = custom_env.eval_draws if custom_env else 0
+
     while battles_done < n_battles:
         action_masks = get_action_masks(eval_env)
         action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
@@ -145,28 +160,14 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
 
         for i, done in enumerate(dones):
             if done:
-                info = infos[i]
-                # Use the clean terminal reward written by CustomEnv.step() so
-                # that accumulated shaping rewards cannot cause a lost battle
-                # (with positive shaping points) to be miscounted as a win.
-                terminal_reward = info.get("terminal_reward", None)
-                if terminal_reward is not None:
-                    if terminal_reward > 0.5:
-                        wins += 1
-                    elif terminal_reward < -0.5:
-                        losses += 1
-                    else:
-                        draws += 1
-                else:
-                    # Fallback: should never happen in normal operation, but
-                    # guards against edge cases where the key is missing.
-                    ep_reward = info.get("episode", {}).get("r", 0)
-                    if ep_reward > 0.5:
-                        wins += 1
-                    elif ep_reward < -0.5:
-                        losses += 1
-                    else:
-                        draws += 1
+                # Read cumulative counters set inside calc_reward before reset.
+                # These are incremented at the moment battle.won is valid,
+                # before DummyVecEnv calls reset() and clobbers battle1.
+                if custom_env is not None:
+                    wins   = custom_env.eval_wins   - prev_w
+                    losses = custom_env.eval_losses - prev_l
+                    draws  = custom_env.eval_draws  - prev_d
+
                 battles_done += 1
                 pbar.update(1)
                 pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
@@ -184,10 +185,8 @@ class InferenceAgent(Player):
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
         self._model = model
-        # Gen 2 data (used for move effectiveness and speed lookups)
         self._gen_data = GenData.from_gen(2)
         self._species_to_id = {name: i for i, name in enumerate(self._gen_data.pokedex.keys())}
-        # Item lookup
         try:
             all_items = list(self._gen_data.items.keys())
         except AttributeError:
@@ -274,7 +273,6 @@ class InferenceAgent(Player):
             if battle.active_pokemon and battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
-            # One-hot typed active mon features (38 each)
             active_features     = _encode_active_mon(battle.active_pokemon)
             opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
 
@@ -291,24 +289,19 @@ class InferenceAgent(Player):
                     except Exception:
                         pass
 
-            # All boosts normalized to [-1, 1] via /6
-            own_boosts = _encode_boosts(battle.active_pokemon)           # [atk, def, spe, spa, spd]
-            opp_boosts = _encode_boosts(battle.opponent_active_pokemon)  # [atk, def, spe, spa, spd]
+            own_boosts = _encode_boosts(battle.active_pokemon)
+            opp_boosts = _encode_boosts(battle.opponent_active_pokemon)
 
-            # Gen 2: held item IDs
             own_item_id = np.float32([self._get_item_id(battle.active_pokemon)])
             opp_item_id = np.float32([self._get_item_id(battle.opponent_active_pokemon)])
 
             own_status_flags = _encode_status_flags(battle.active_pokemon)
             opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
 
-            # Turn counter: normalized to [0, 1] over 150 turns, clamped at 1.0
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
-            # Alive flags: 1.0=alive, 0.0=fainted for each of 6 slots
-            # opp unseen slots default to 1.0 (assume alive until proven otherwise)
-            opp_alive_flags = _get_opp_alive_flags(battle)  # 6
-            own_alive_flags = _get_own_alive_flags(battle)  # 6
+            opp_alive_flags = _get_opp_alive_flags(battle)
+            own_alive_flags = _get_own_alive_flags(battle)
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
@@ -323,22 +316,22 @@ class InferenceAgent(Player):
                 self_status,             # 6
                 opponent_status,         # 6
                 special_case,            # 2
-                active_features,         # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
-                opp_active_features,     # 38  [hp, status, type1_onehot(18), type2_onehot(18)]
+                active_features,         # 38
+                opp_active_features,     # 38
                 own_speed,               # 1
                 opp_speed,               # 1
                 opp_move_eff,            # 4
-                own_boosts,              # 5   [atk, def, spe, spa, spd]
-                opp_boosts,              # 5   [atk, def, spe, spa, spd]
+                own_boosts,              # 5
+                opp_boosts,              # 5
                 own_item_id,             # 1
                 opp_item_id,             # 1
-                own_status_flags,        # 5   [slp, frz, par, brn, psn]
-                opp_status_flags,        # 5   [slp, frz, par, brn, psn]
-                turn_counter,            # 1   normalized turn [0, 1]
-                opp_alive_flags,         # 6   [1.0=alive, 0.0=fainted] opponent slots
-                own_alive_flags,         # 6   [1.0=alive, 0.0=fainted] own slots
+                own_status_flags,        # 5
+                opp_status_flags,        # 5
+                turn_counter,            # 1
+                opp_alive_flags,         # 6
+                own_alive_flags,         # 6
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1+6+6 = 179
+            # Total: 179
 
         except Exception:
             return np.zeros(OBS_SIZE, dtype=np.float32)

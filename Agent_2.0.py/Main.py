@@ -10,12 +10,12 @@ if __name__ == "__main__":
     # Configuration
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "human" | "league"
-    MODE = "continue"
+    MODE = "eval"
     MODEL_NAME     = "Agent2"
     TRAINING_STEPS = 500000
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
-    N_ENVS_RUN  = 8
+    N_ENVS_RUN  = 6
     USE_SUBPROC = True  
 
     # Human mode    
@@ -44,7 +44,7 @@ if __name__ == "__main__":
         train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=100, battle_format=BATTLE_FORMAT)
+        eval_model(MODEL_NAME, n_battles=15, battle_format=BATTLE_FORMAT)
 
     elif MODE == "human":
         asyncio.run(play_vs_human(MODEL_NAME, HUMAN_USERNAME, N_HUMAN_BATTLES, battle_format=BATTLE_FORMAT))
