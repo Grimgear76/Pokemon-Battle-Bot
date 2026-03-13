@@ -229,7 +229,7 @@ class MaxDamagePlayer(Player):
             if mon.status is None and mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.5: return False
         if move.id == "sleeptalk" and not _is_asleep(mon): return False
         if getattr(move, 'heal', 0) and move.id != "rest":
-            if mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.8: return False  # changed from 0.85
+            if mon.max_hp > 0 and (mon.current_hp / mon.max_hp) > 0.8: return False
         if getattr(move, 'status', None) and battle.opponent_active_pokemon is not None:
             if battle.opponent_active_pokemon.status is not None: return False
         if move.base_power == 0 or move.base_power is None:
@@ -276,7 +276,7 @@ class ProgressCallback(BaseCallback):
         self.episode_count = 0
         self.wins = 0
         self.losses = 0
-        self._custom_envs = []   # populated on training start
+        self._custom_envs = []
         self._prev_w = []
         self._prev_l = []
 
@@ -324,11 +324,18 @@ class ProgressCallback(BaseCallback):
                     )
                 else:
                     info = infos[i] if i < len(infos) else {}
-                    ep_reward = info.get("episode", {}).get("r", 0)
-                    if ep_reward > 2.0:
-                        self.wins += 1
-                    elif ep_reward < -2.0:
-                        self.losses += 1
+                    terminal_reward = info.get("terminal_reward", None)
+                    if terminal_reward is not None:
+                        if terminal_reward > 0.5:
+                            self.wins += 1
+                        elif terminal_reward < -0.5:
+                            self.losses += 1
+                    else:
+                        ep_reward = info.get("episode", {}).get("r", 0)
+                        if ep_reward > 2.0:
+                            self.wins += 1
+                        elif ep_reward < -2.0:
+                            self.losses += 1
         if self.episode_count > 0:
             wr = self.wins / self.episode_count
             self.pbar.set_postfix(battles=self.episode_count, W=self.wins, L=self.losses, WR=f"{wr:.1%}", refresh=False)
@@ -506,7 +513,7 @@ class CustomEnv(SinglesEnv):
             else:
                 terminal = -1.0
 
-            # --- Faster win bonus ---
+            # Faster win bonus
             if battle.won:
                 terminal += max(0.0, (80 - battle.turn) / 80) * 0.3
 
@@ -533,7 +540,7 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted  = my_fainted_now
 
-        # --- HP damage delta ---
+        # --- HP damage delta (per-active-mon, species-gated to avoid switch noise) ---
         HP_CHANGE_THRESHOLD = 0.015
         opp_active = battle.opponent_active_pokemon
         own_active  = battle.active_pokemon
@@ -568,11 +575,11 @@ class CustomEnv(SinglesEnv):
         # --- Small flat time penalty ---
         reward -= 0.003
 
-        # --- Late-game time pressure (one-time value per turn, not additive) ---
+        # --- Late-game time pressure ---
         if battle.turn > 20:
             reward -= min((battle.turn - 20) * 0.02, 0.5)
 
-        # --- Deadlock penalty (single counter, capped) ---
+        # --- Deadlock penalty ---
         if not opp_hp_actually_dropped and not own_hp_actually_dropped and not battle.force_switch:
             self._deadlock_turns += 1
             if self._deadlock_turns > 5:
@@ -736,6 +743,60 @@ def _get_custom_env(env) -> Optional[CustomEnv]:
 
 
 # -----------------------------
+# Move allow helper (used by mask_env)
+# -----------------------------
+def _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacitated) -> bool:
+    # Sleep Talk only usable while asleep
+    if move.id == "sleeptalk" and not _is_asleep(own_mon):
+        return False
+
+    # Rest: blocked if already asleep, HP too high, or healthy with no status
+    if move.id == "rest":
+        hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
+        if _is_asleep(own_mon):
+            return False
+        if hp_ratio > 0.8:
+            return False
+        if own_mon.status is None and hp_ratio > 0.5:
+            return False
+
+    # Other healing moves: block at high HP
+    if getattr(move, 'heal', 0) and move.id != "rest":
+        hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
+        if hp_ratio > 0.85:
+            return False
+
+    # Status moves: block if opponent already has a status condition
+    if getattr(move, 'status', None) and battle.opponent_active_pokemon is not None:
+        if battle.opponent_active_pokemon.status is not None:
+            return False
+
+    # Stat boost moves: block if the relevant stat is already maxed (+6)
+    if move.base_power == 0 or move.base_power is None:
+        move_id = move.id
+        if move_id in ("agility", "rocksmash") and boosts.get("spe", 0) >= 6:
+            return False
+        if move_id in ("swordsdance", "meditate", "sharpen") and boosts.get("atk", 0) >= 6:
+            return False
+        if move_id == "growth" and boosts.get("spa", 0) >= 6 and boosts.get("spd", 0) >= 6:
+            return False
+        if move_id in ("nastyplot", "chargebeam") and boosts.get("spa", 0) >= 6:
+            return False
+        if move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:
+            return False
+        if move_id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
+            return False
+
+    # Block zero-power moves entirely when incapacitated (asleep or frozen),
+    # except Sleep Talk which is the only valid action while asleep.
+    if own_incapacitated and (move.base_power == 0 or move.base_power is None):
+        if move.id != "sleeptalk":
+            return False
+
+    return True
+
+
+# -----------------------------
 # Masking function
 # -----------------------------
 def mask_env(env):
@@ -782,36 +843,12 @@ def mask_env(env):
     if not battle.force_switch:
         move_slots_open = any(action_mask[move_offset:move_offset + len(moves)])
         if not move_slots_open and any(action_mask[:6]):
-            pass  # All move slots masked, switches only — already correct
+            pass  # switches only — already correct
 
     if not any(action_mask):
         action_mask[choose_default] = 1
 
     return action_mask
-
-
-def _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacitated):
-    # Sleep Talk only usable while asleep
-    if move.id == "sleeptalk" and not _is_asleep(own_mon):
-        return False
-
-    # Rest: blocked if already asleep, HP too high, or healthy with no status
-    if move.id == "rest":
-        hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
-        if _is_asleep(own_mon):
-            return False
-        if hp_ratio > 0.8:
-            return False
-        if own_mon.status is None and hp_ratio > 0.5:
-            return False
-
-    # Other healing moves: block at high HP
-    if getattr(move, 'heal', 0) and move.id != "rest":
-        hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
-        if hp_ratio > 0.85:
-            return False
-
-    # Status moves: block if opponent already has a status condition
 
 
 # -----------------------------

@@ -1,7 +1,7 @@
 import asyncio
 import multiprocessing
 
-from bot_training import train_new, train_continue, eval_model, play_vs_human, train_vs_opponent
+from bot_training import train_new, train_continue, eval_model, eval_model_vs_model, play_vs_human, train_vs_opponent
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
@@ -9,16 +9,16 @@ if __name__ == "__main__":
     # -----------------------------
     # Configuration
     # -----------------------------
-    # Modes: "new" | "continue" | "eval" | "human" | "league"
+    # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league"
     MODE = "human"
-    MODEL_NAME     = "Agent4Gen2"
+    MODEL_NAME     = "Agent4Gen3"
     TRAINING_STEPS = 500000
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6
-    USE_SUBPROC = True  
+    USE_SUBPROC = True
 
-    # Human mode    
+    # Human mode
     HUMAN_USERNAME  = "Grimgear76"
     N_HUMAN_BATTLES = 3
 
@@ -28,8 +28,13 @@ if __name__ == "__main__":
     #   LEARNER_NAME = "Gen2"  |  OPPONENT_NAME = "ParallelTest8"
     #   next iteration
     #   LEARNER_NAME = "Gen3"  |  OPPONENT_NAME = "Gen2"
-    LEARNER_NAME  = "Agent4Gen2"
-    OPPONENT_NAME = "Agent4Gen3"
+    LEARNER_NAME  = "Agent4Gen3"
+    OPPONENT_NAME = "Agent4Gen2"
+
+    # Eval vs model mode — head-to-head evaluation between two saved models
+    CHALLENGER_NAME  = "Agent4Gen3"
+    EVAL_VS_OPPONENT = "Agent4Gen2"
+    N_EVAL_BATTLES   = 100
 
     # Derive battle format from GEN
     BATTLE_FORMAT = f"gen{GEN}randombattle"
@@ -44,7 +49,10 @@ if __name__ == "__main__":
         train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=200, battle_format=BATTLE_FORMAT)
+        eval_model(MODEL_NAME, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT)
+
+    elif MODE == "eval_vs":
+        eval_model_vs_model(CHALLENGER_NAME, EVAL_VS_OPPONENT, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT)
 
     elif MODE == "human":
         asyncio.run(play_vs_human(MODEL_NAME, HUMAN_USERNAME, N_HUMAN_BATTLES, battle_format=BATTLE_FORMAT))

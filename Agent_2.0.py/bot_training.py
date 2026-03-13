@@ -51,6 +51,18 @@ def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
 
 
 # -----------------------------
+# Shared helper: walk wrapper chain to find CustomEnv
+# -----------------------------
+def _get_custom_env(vec_env, i: int = 0):
+    inner = vec_env.envs[i]
+    while inner is not None:
+        if hasattr(inner, 'eval_wins'):
+            return inner
+        inner = getattr(inner, 'env', None)
+    return None
+
+
+# -----------------------------
 # Train new
 # -----------------------------
 def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
@@ -117,7 +129,7 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
 
 
 # -----------------------------
-# Eval
+# Eval vs built-in opponent
 # -----------------------------
 def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2randombattle"):
     path = model_path(model_name)
@@ -134,20 +146,11 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
     obs = eval_env.reset()
     battles_done = 0
 
-    # Get reference to CustomEnv for direct counter access
-    def get_custom_env(vec_env, i=0):
-        inner = vec_env.envs[i]
-        while inner is not None:
-            if hasattr(inner, 'eval_wins'):
-                return inner
-            inner = getattr(inner, 'env', None)
-        return None
-
-    custom_env = get_custom_env(eval_env)
+    custom_env = _get_custom_env(eval_env)
     # Snapshot counters before we start (in case env was reused)
-    prev_w = custom_env.eval_wins if custom_env else 0
+    prev_w = custom_env.eval_wins   if custom_env else 0
     prev_l = custom_env.eval_losses if custom_env else 0
-    prev_d = custom_env.eval_draws if custom_env else 0
+    prev_d = custom_env.eval_draws  if custom_env else 0
 
     while battles_done < n_battles:
         action_masks = get_action_masks(eval_env)
@@ -175,6 +178,118 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
     pbar.close()
     eval_env.close()
     print(f"\n[Results] Battles: {n_battles} | Wins: {wins} | Losses: {losses} | Draws: {draws} | Win Rate: {wins/n_battles:.1%}")
+    return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / n_battles}
+
+
+# -----------------------------
+# Eval model1 vs model2
+# -----------------------------
+def eval_model_vs_model(
+    challenger_name: str,
+    opponent_name: str,
+    n_battles: int = 100,
+    battle_format: str = "gen2randombattle"
+):
+    """
+    Evaluates challenger_name against a frozen opponent_name.
+    Uses the same eval_wins/losses/draws counter pattern as eval_model
+    for 100% accurate tracking — counters are incremented inside calc_reward
+    before any reset can clobber battle1.
+    """
+    challenger_path = model_path(challenger_name)
+    opponent_path   = model_path(opponent_name)
+
+    if not challenger_path.exists():
+        print(f"Challenger model '{challenger_name}' not found!")
+        return
+    if not opponent_path.exists():
+        print(f"Opponent model '{opponent_name}' not found!")
+        return
+
+    print(
+        f"[Model vs Model] {challenger_name} vs {opponent_name} | "
+        f"battles={n_battles} | format={battle_format}"
+    )
+
+    # Load the frozen opponent once — shared across the single eval env
+    frozen_opponent_model = MaskablePPO.load(
+        opponent_path,
+        policy_kwargs=dict(net_arch=NET_ARCH)
+    )
+
+    def make_vs_env(env_id: int = 0):
+        def _init():
+            agent_config    = AccountConfiguration(f"agent_{env_id}", None)
+            opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
+
+            env = CustomEnv(
+                battle_format=battle_format,
+                log_level=30,
+                open_timeout=None,
+                strict=False,
+                account_configuration1=agent_config,
+                account_configuration2=opponent_config,
+                server_configuration=LocalhostServerConfiguration,
+            )
+
+            opponent = InferenceAgent(
+                model=frozen_opponent_model,
+                battle_format=battle_format,
+                account_configuration=opponent_config,
+                server_configuration=LocalhostServerConfiguration,
+                start_listening=False,
+            )
+
+            base_env = SingleAgentWrapper(env, opponent)
+            return Monitor(ActionMasker(base_env, mask_env))
+        return _init
+
+    eval_env = DummyVecEnv([make_vs_env(env_id=0)])
+    challenger_model = MaskablePPO.load(
+        challenger_path,
+        env=eval_env,
+        policy_kwargs=dict(net_arch=NET_ARCH)
+    )
+
+    wins, losses, draws = 0, 0, 0
+    pbar = tqdm(total=n_battles, desc=f"{challenger_name} vs {opponent_name}", unit="battles")
+    obs = eval_env.reset()
+    battles_done = 0
+
+    # Same counter pattern as eval_model — walk the wrapper chain,
+    # snapshot before starting, read deltas on each done.
+    custom_env = _get_custom_env(eval_env)
+    prev_w = custom_env.eval_wins   if custom_env else 0
+    prev_l = custom_env.eval_losses if custom_env else 0
+    prev_d = custom_env.eval_draws  if custom_env else 0
+
+    while battles_done < n_battles:
+        action_masks = get_action_masks(eval_env)
+        action, _ = challenger_model.predict(obs, action_masks=action_masks, deterministic=True)
+        try:
+            obs, reward, dones, infos = eval_env.step(action)
+        except AssertionError:
+            obs = eval_env.reset()
+            continue
+
+        for i, done in enumerate(dones):
+            if done:
+                if custom_env is not None:
+                    wins   = custom_env.eval_wins   - prev_w
+                    losses = custom_env.eval_losses - prev_l
+                    draws  = custom_env.eval_draws  - prev_d
+
+                battles_done += 1
+                pbar.update(1)
+                pbar.set_postfix(W=wins, L=losses, D=draws, WR=f"{wins/battles_done:.1%}")
+
+    pbar.close()
+    eval_env.close()
+    print(
+        f"\n[Results] {challenger_name} vs {opponent_name} | "
+        f"Battles: {n_battles} | Wins: {wins} | Losses: {losses} | Draws: {draws} | "
+        f"Win Rate: {wins/n_battles:.1%}"
+    )
     return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / n_battles}
 
 
