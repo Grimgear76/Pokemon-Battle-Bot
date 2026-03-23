@@ -20,7 +20,8 @@ from tqdm import tqdm
 
 from constants import (
     OBS_SIZE, ACTION_SPACE_SIZE, NET_ARCH, MAX_SPEED,
-    N_ENVS, N_STEPS, ENT_COEF, STATUS_MAP
+    N_ENVS, N_STEPS, ENT_COEF, STATUS_MAP,
+    SPECIES_NUM_SCALE,
 )
 
 # -----------------------------
@@ -177,38 +178,18 @@ def _type_onehot(type_obj) -> np.ndarray:
 
 def _encode_active_mon(mon) -> np.ndarray:
     """
-    Returns a 38-element float32 array:
-      [hp(1), status(1), type1_onehot(18), type2_onehot(18)]
+    Returns a 37-element float32 array:
+      [hp(1), type1_onehot(18), type2_onehot(18)]
     type2 is all-zeros for mono-type Pokemon.
+
+    Status scalar removed — it was a duplicate of own_status_flags / opp_status_flags
+    already present in the main observation, wasting 2 dimensions per call.
     """
     hp = np.float32([-1.0 if (mon is None or mon.fainted or mon.max_hp == 0)
                      else (mon.current_hp / mon.max_hp) * 2 - 1])
-    status_key = (mon.status.value if mon.status else None) if mon is not None else None
-    status = np.float32([STATUS_MAP.get(status_key, 0.0)])
     type1 = _type_onehot(mon.type_1 if mon is not None else None)
     type2 = _type_onehot(mon.type_2 if mon is not None else None)
-    return np.concatenate([hp, status, type1, type2])  # 1+1+18+18 = 38
-
-
-# -----------------------------
-# Alive flags helpers
-# -----------------------------
-def _get_opp_alive_flags(battle) -> np.ndarray:
-    flags = []
-    for mon in battle.opponent_team.values():
-        flags.append(0.0 if mon.fainted else 1.0)
-    while len(flags) < 6:
-        flags.append(1.0)
-    return np.float32(flags[:6])
-
-
-def _get_own_alive_flags(battle) -> np.ndarray:
-    flags = []
-    for mon in battle.team.values():
-        flags.append(0.0 if mon.fainted else 1.0)
-    while len(flags) < 6:
-        flags.append(1.0)
-    return np.float32(flags[:6])
+    return np.concatenate([hp, type1, type2])  # 1+18+18 = 37
 
 
 # -----------------------------
@@ -349,7 +330,8 @@ class ProgressCallback(BaseCallback):
 # Entropy Monitor Callback
 # -----------------------------
 class EntropyMonitorCallback(BaseCallback):
-    ENTROPY_THRESHOLD = 0.5
+    # Threshold raised from 0.5 to 1.0.
+    ENTROPY_THRESHOLD = 1.0
     ENT_COEF_BOOST = 0.05
     ENT_COEF_NORMAL = ENT_COEF
 
@@ -391,7 +373,12 @@ class CustomEnv(SinglesEnv):
             for agent in self.possible_agents
         }
         self.gen_data = GenData.from_gen(2)
-        self.species_to_id = {name: i for i, name in enumerate(self.gen_data.pokedex.keys())}
+
+        # Species encoding: use the built-in National Dex `num` field directly.
+        # No hand-written list needed — GenData.pokedex already has every species.
+        # _get_species_id() normalises num to [-1, 1] over the Gen 1+2 range (1–251).
+        # (Stored on gen_data, which is already initialised above.)
+
         try:
             all_items = list(self.gen_data.items.keys())
         except AttributeError:
@@ -426,8 +413,25 @@ class CustomEnv(SinglesEnv):
         if mon is None or mon.species is None: return 0.0
         try:
             speed = self.gen_data.pokedex[mon.species.lower()]["baseStats"]["spe"]
+
             return (speed / MAX_SPEED) * 2 - 1
         except (KeyError, TypeError): return 0.0
+
+    def _get_species_num(self, mon) -> float:
+        """
+        Returns the species National Dex number normalised to [-1, 1] over 1–251.
+        Uses the `num` field from GenData.pokedex — no hand-written species list needed.
+        Unknown species (not in pokedex, or num outside 1–251) return 0.0.
+        """
+        if mon is None or mon.species is None:
+            return 0.0
+        try:
+            num = self.gen_data.pokedex[mon.species.lower()]["num"]
+            if not (1 <= num <= 251):
+                return 0.0
+            return (num / SPECIES_NUM_SCALE) * 2 - 1
+        except (KeyError, TypeError):
+            return 0.0
 
     def _get_item_id(self, mon) -> float:
         if mon is None: return 0.0
@@ -466,15 +470,18 @@ class CustomEnv(SinglesEnv):
         env = cls(
             battle_format=config["battle_format"],
             log_level=30,
-            open_timeout=None,
+            # FIX: open_timeout=None can hang indefinitely if the Showdown server is slow.
+            open_timeout=60,
             strict=False,
             account_configuration1=agent_config,
             account_configuration2=opponent_config,
             server_configuration=LocalhostServerConfiguration,
         )
-        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
         #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
-        opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
+        #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
@@ -499,9 +506,6 @@ class CustomEnv(SinglesEnv):
                 total_max += mon.max_hp
         return 0.0 if total_max == 0 else total_current / total_max
 
-    def _get_team_hp_fraction_gross(self, team) -> float:
-        return self._get_team_hp_fraction(team)
-
     def calc_reward(self, battle) -> float:
         reward = 0.0
 
@@ -512,10 +516,8 @@ class CustomEnv(SinglesEnv):
                 terminal = 1.0
             else:
                 terminal = -1.0
-
-            # Faster win bonus
             if battle.won:
-                terminal += max(0.0, (80 - battle.turn) / 80) * 0.3
+                terminal += max(0.0, (80 - battle.turn) / 80) * 0.15 # Bonus for faster wins, up to +0.15 at turn 1, tapering to 0 by turn 80
 
             self._terminal_reward = terminal
             self._battle_won = battle.won
@@ -546,6 +548,7 @@ class CustomEnv(SinglesEnv):
         own_active  = battle.active_pokemon
         opp_species = opp_active.species if opp_active else None
         own_species  = own_active.species  if own_active  else None
+
         opp_hp_now = (opp_active.current_hp / opp_active.max_hp
                       if opp_active and not opp_active.fainted and opp_active.max_hp > 0 else 0.0)
         own_hp_now  = (own_active.current_hp  / own_active.max_hp
@@ -575,9 +578,10 @@ class CustomEnv(SinglesEnv):
         # --- Small flat time penalty ---
         reward -= 0.003
 
-        # --- Late-game time pressure ---
-        if battle.turn > 20:
-            reward -= min((battle.turn - 20) * 0.02, 0.5)
+        # Late-game time pressure.
+        # Old formula: -(turn - 20) * 0.02 per step, capped at -0.5.
+        if battle.turn > 40:
+            reward -= min((battle.turn - 60) * 0.001, 0.05)
 
         # --- Deadlock penalty ---
         if not opp_hp_actually_dropped and not own_hp_actually_dropped and not battle.force_switch:
@@ -587,16 +591,9 @@ class CustomEnv(SinglesEnv):
         else:
             self._deadlock_turns = 0
 
-        # --- Switch penalty (only for clearly wasted switches) ---
-        if self._last_action_was_switch and not battle.force_switch:
-            if not opp_hp_actually_dropped:
-                self._consec_wasted_switches += 1
-                if self._consec_wasted_switches > 2:
-                    reward -= min(0.02 * (self._consec_wasted_switches - 2), 0.06)
-            else:
-                self._consec_wasted_switches = 0
-        else:
-            self._consec_wasted_switches = 0
+        # Wasted-switch penalty removed entirely.
+        
+       
 
         return reward
 
@@ -610,8 +607,6 @@ class CustomEnv(SinglesEnv):
             moves_pp_ratio = np.zeros(moves)
             team_hp_ratio = np.ones(pokemon_team)
             opponent_hp_ratio = np.ones(pokemon_team)
-            opponent_team_status = np.ones(pokemon_team, dtype=np.float32)
-            self_team_status = np.ones(pokemon_team, dtype=np.float32)
             team_identifier = np.zeros(pokemon_team, dtype=np.float32)
             opponent_identifier = np.zeros(pokemon_team, dtype=np.float32)
             self_status = np.zeros(pokemon_team, dtype=np.float32)
@@ -634,23 +629,21 @@ class CustomEnv(SinglesEnv):
                             ) - 1.0, -1.0, 1.0)
                     moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
                 except AssertionError: pass
-            for i, mon in enumerate(battle.team.values()):
-                if mon.fainted: self_team_status[i] = -1.0
-            for i, mon in enumerate(battle.opponent_team.values()):
-                if mon.fainted: opponent_team_status[i] = -1.0
+            # Species identifiers — National Dex num from GenData, normalised to [-1, 1]
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                if mon is not None and mon.species is not None:
-                    idx = self.species_to_id.get(mon.species.lower(), 0)
-                    team_identifier[i] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
+                team_identifier[i] = self._get_species_num(mon)
             for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                if mon is not None and mon.species is not None:
-                    idx = self.species_to_id.get(mon.species.lower(), 0)
-                    opponent_identifier[i] = (idx / (len(self.species_to_id) - 1)) * 2 - 1
+                opponent_identifier[i] = self._get_species_num(mon)
+
+            # FIX: Use mon.status.name.lower() instead of mon.status.value.
+            # In poke-env, Status is an IntEnum so .value returns an integer (e.g. 1),
+            # which never matches the string keys in STATUS_MAP ("brn", "slp", etc.).
+            # This bug caused all status lookups to silently return 0.0 (no status).
             for i, mon in enumerate(battle.team.values()):
-                status_key = mon.status.value if mon.status else None
+                status_key = mon.status.name.lower() if mon.status else None
                 self_status[i] = STATUS_MAP.get(status_key, 0.0)
             for i, mon in enumerate(battle.opponent_team.values()):
-                status_key = mon.status.value if mon.status else None
+                status_key = mon.status.name.lower() if mon.status else None
                 opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
 
             if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
@@ -658,6 +651,7 @@ class CustomEnv(SinglesEnv):
             if battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
+            # _encode_active_mon returns 37 dims [hp, type1_onehot(18), type2_onehot(18)]
             active_features     = _encode_active_mon(battle.active_pokemon)
             opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
             own_speed    = np.float32([self._get_speed(battle.active_pokemon)])
@@ -670,15 +664,20 @@ class CustomEnv(SinglesEnv):
             own_status_flags = _encode_status_flags(battle.active_pokemon)
             opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
-            opp_alive_flags = _get_opp_alive_flags(battle)
-            own_alive_flags = _get_own_alive_flags(battle)
+
+            # Explicit binary alive flags — cleaner than relying on the network to decode
+            # the -1.0 HP sentinel in team_hp_ratio as meaning "fainted".
+            own_alive_flags = np.float32([0.0 if mon.fainted else 1.0
+                                          for mon in battle.team.values()]
+                                         + [1.0] * (6 - len(battle.team)))
+            opp_alive_flags = np.float32([0.0 if mon.fainted else 1.0
+                                          for mon in battle.opponent_team.values()]
+                                         + [1.0] * (6 - len(battle.opponent_team)))
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
                 moves_pp_ratio,          # 4
-                self_team_status,        # 6
-                opponent_team_status,    # 6
                 team_hp_ratio,           # 6
                 opponent_hp_ratio,       # 6
                 team_identifier,         # 6
@@ -686,8 +685,8 @@ class CustomEnv(SinglesEnv):
                 self_status,             # 6
                 opponent_status,         # 6
                 special_case,            # 2
-                active_features,         # 38
-                opp_active_features,     # 38
+                active_features,         # 37
+                opp_active_features,     # 37
                 own_speed,               # 1
                 opp_speed,               # 1
                 opp_move_eff,            # 4
@@ -698,10 +697,10 @@ class CustomEnv(SinglesEnv):
                 own_status_flags,        # 5
                 opp_status_flags,        # 5
                 turn_counter,            # 1
-                opp_alive_flags,         # 6
                 own_alive_flags,         # 6
+                opp_alive_flags,         # 6
             ]))
-            # Total: 4+4+4+6+6+6+6+6+6+6+6+2+38+38+1+1+4+5+5+1+1+5+5+1+6+6 = 179
+            # Total: 4+4+4+6+6+6+6+6+6+2+37+37+1+1+4+5+5+1+1+5+5+1+6+6 = 165
 
         except AssertionError:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -849,6 +848,20 @@ def mask_env(env):
         action_mask[choose_default] = 1
 
     return action_mask
+
+
+# -----------------------------
+# Learning rate schedule
+# -----------------------------
+def linear_lr_schedule(initial_lr: float):
+    """
+    Returns a callable that linearly decays the learning rate from
+    initial_lr to 0 as training progress goes from 1.0 to 0.0.
+    Pass this as learning_rate= when constructing the PPO model.
+    """
+    def schedule(progress_remaining: float) -> float:
+        return initial_lr * progress_remaining
+    return schedule
 
 
 # -----------------------------

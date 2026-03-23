@@ -10,9 +10,9 @@ if __name__ == "__main__":
     # Configuration
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league"
-    MODE = "human"
-    MODEL_NAME     = "Agent4Gen3"
-    TRAINING_STEPS = 500000
+    MODE = "eval"
+    MODEL_NAME     = "Agent5"
+    TRAINING_STEPS = 500000 
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6
@@ -31,7 +31,7 @@ if __name__ == "__main__":
     LEARNER_NAME  = "Agent4Gen3"
     OPPONENT_NAME = "Agent4Gen2"
 
-    # Eval vs model mode — head-to-head evaluation between two saved models
+    # Eval_vs model mode — head-to-head evaluation between two saved models
     CHALLENGER_NAME  = "Agent4Gen3"
     EVAL_VS_OPPONENT = "Agent4Gen2"
     N_EVAL_BATTLES   = 100
