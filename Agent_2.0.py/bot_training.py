@@ -18,25 +18,33 @@ from poke_env import AccountConfiguration, LocalhostServerConfiguration
 from constants import (
     NET_ARCH, LEARNING_RATE, N_STEPS, BATCH_SIZE, N_EPOCHS,
     ENT_COEF, CLIP_RANGE, GAE_LAMBDA, N_ENVS, OBS_SIZE,
-    ACTION_SPACE_SIZE, MAX_SPEED, STATUS_MAP, model_path
+    ACTION_SPACE_SIZE, MAX_SPEED, STATUS_MAP, SPECIES_NUM_SCALE,
+    model_path
 )
 from environment import (
-    make_vec_env, ProgressCallback, EntropyMonitorCallback,
-    CustomEnv, mask_env, _is_frozen, _is_paralyzed,
-    _encode_boosts, _encode_status_flags, _encode_active_mon,
-    _get_opp_alive_flags, _get_own_alive_flags,
+    CustomEnv,
+    make_vec_env,
+    ProgressCallback,
+    EntropyMonitorCallback,
+    mask_env,
+    _encode_active_mon,
+    _encode_boosts,
+    _encode_status_flags,
+    linear_lr_schedule,
 )
-
 
 # -----------------------------
 # Build model
 # -----------------------------
 def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
     return MaskablePPO(
-        "MlpPolicy",
+        # FIX: ActionMasker wraps the obs space in a Dict to bundle the action mask,
+        # so MlpPolicy raises "You must use MultiInputPolicy". MultiInputPolicy
+        # handles both flat Box and Dict obs spaces correctly.
+        "MultiInputPolicy",
         env,
         verbose=0,
-        learning_rate=LEARNING_RATE,
+        learning_rate=linear_lr_schedule(LEARNING_RATE),
         n_steps=N_STEPS,
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
@@ -108,7 +116,7 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
         policy_kwargs=dict(net_arch=NET_ARCH)
     )
 
-    model.learning_rate = LEARNING_RATE
+    model.learning_rate = linear_lr_schedule(LEARNING_RATE)
     for param_group in model.policy.optimizer.param_groups:
         param_group["lr"] = LEARNING_RATE
 
@@ -147,7 +155,6 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
     battles_done = 0
 
     custom_env = _get_custom_env(eval_env)
-    # Snapshot counters before we start (in case env was reused)
     prev_w = custom_env.eval_wins   if custom_env else 0
     prev_l = custom_env.eval_losses if custom_env else 0
     prev_d = custom_env.eval_draws  if custom_env else 0
@@ -163,9 +170,6 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
 
         for i, done in enumerate(dones):
             if done:
-                # Read cumulative counters set inside calc_reward before reset.
-                # These are incremented at the moment battle.won is valid,
-                # before DummyVecEnv calls reset() and clobbers battle1.
                 if custom_env is not None:
                     wins   = custom_env.eval_wins   - prev_w
                     losses = custom_env.eval_losses - prev_l
@@ -190,12 +194,6 @@ def eval_model_vs_model(
     n_battles: int = 100,
     battle_format: str = "gen2randombattle"
 ):
-    """
-    Evaluates challenger_name against a frozen opponent_name.
-    Uses the same eval_wins/losses/draws counter pattern as eval_model
-    for 100% accurate tracking — counters are incremented inside calc_reward
-    before any reset can clobber battle1.
-    """
     challenger_path = model_path(challenger_name)
     opponent_path   = model_path(opponent_name)
 
@@ -211,7 +209,6 @@ def eval_model_vs_model(
         f"battles={n_battles} | format={battle_format}"
     )
 
-    # Load the frozen opponent once — shared across the single eval env
     frozen_opponent_model = MaskablePPO.load(
         opponent_path,
         policy_kwargs=dict(net_arch=NET_ARCH)
@@ -225,7 +222,7 @@ def eval_model_vs_model(
             env = CustomEnv(
                 battle_format=battle_format,
                 log_level=30,
-                open_timeout=None,
+                open_timeout=60,
                 strict=False,
                 account_configuration1=agent_config,
                 account_configuration2=opponent_config,
@@ -256,8 +253,6 @@ def eval_model_vs_model(
     obs = eval_env.reset()
     battles_done = 0
 
-    # Same counter pattern as eval_model — walk the wrapper chain,
-    # snapshot before starting, read deltas on each done.
     custom_env = _get_custom_env(eval_env)
     prev_w = custom_env.eval_wins   if custom_env else 0
     prev_l = custom_env.eval_losses if custom_env else 0
@@ -294,14 +289,18 @@ def eval_model_vs_model(
 
 
 # -----------------------------
-# Inference Agent (sync - works inside SB3 env loop)
+# Inference Agent
 # -----------------------------
 class InferenceAgent(Player):
+    """
+    Standalone inference player used for model-vs-model eval and human play.
+    _embed() must stay in sync with CustomEnv.embed_battle() in environment.py.
+    Current layout: 165 dims (see constants.py OBS_SIZE comment for breakdown).
+    """
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
         self._model = model
         self._gen_data = GenData.from_gen(2)
-        self._species_to_id = {name: i for i, name in enumerate(self._gen_data.pokedex.keys())}
         try:
             all_items = list(self._gen_data.items.keys())
         except AttributeError:
@@ -315,6 +314,18 @@ class InferenceAgent(Player):
         try:
             speed = self._gen_data.pokedex[mon.species.lower()]["baseStats"]["spe"]
             return (speed / MAX_SPEED) * 2 - 1
+        except (KeyError, TypeError):
+            return 0.0
+
+    def _get_species_num(self, mon) -> float:
+        """National Dex num normalised to [-1, 1] over 1–251. Mirrors CustomEnv._get_species_num."""
+        if mon is None or mon.species is None:
+            return 0.0
+        try:
+            num = self._gen_data.pokedex[mon.species.lower()]["num"]
+            if not (1 <= num <= 251):
+                return 0.0
+            return (num / SPECIES_NUM_SCALE) * 2 - 1
         except (KeyError, TypeError):
             return 0.0
 
@@ -333,25 +344,52 @@ class InferenceAgent(Player):
             return 0.0
 
     def _embed(self, battle) -> np.ndarray:
+        """
+        Must produce an identical vector to CustomEnv.embed_battle().
+        Layout (165 dims):
+          moves_base_power        4
+          moves_dmg_multiplier    4
+          moves_pp_ratio          4
+          team_hp_ratio           6
+          opponent_hp_ratio       6
+          team_identifier         6
+          opponent_identifier     6
+          self_status             6
+          opponent_status         6
+          special_case            2
+          active_features        37  [hp, type1_onehot(18), type2_onehot(18)]
+          opp_active_features    37
+          own_speed               1
+          opp_speed               1
+          opp_move_eff            4
+          own_boosts              5
+          opp_boosts              5
+          own_item_id             1
+          opp_item_id             1
+          own_status_flags        5
+          opp_status_flags        5
+          turn_counter            1
+          own_alive_flags         6
+          opp_alive_flags         6
+        """
         try:
             moves_n, pokemon_team = 4, 6
-            moves_base_power = -np.ones(moves_n)
+            moves_base_power     = -np.ones(moves_n)
             moves_dmg_multiplier = np.ones(moves_n)
-            moves_pp_ratio = np.zeros(moves_n)
-            team_hp_ratio = np.ones(pokemon_team)
-            opponent_hp_ratio = np.ones(pokemon_team)
-            opponent_team_status = np.ones(pokemon_team, dtype=np.float32)
-            self_team_status = np.ones(pokemon_team, dtype=np.float32)
-            team_identifier = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_identifier = np.zeros(pokemon_team, dtype=np.float32)
-            self_status = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_status = np.zeros(pokemon_team, dtype=np.float32)
-            special_case = np.zeros(2, dtype=np.float32)
+            moves_pp_ratio       = np.zeros(moves_n)
+            team_hp_ratio        = np.ones(pokemon_team)
+            opponent_hp_ratio    = np.ones(pokemon_team)
+            team_identifier      = np.zeros(pokemon_team, dtype=np.float32)
+            opponent_identifier  = np.zeros(pokemon_team, dtype=np.float32)
+            self_status          = np.zeros(pokemon_team, dtype=np.float32)
+            opponent_status      = np.zeros(pokemon_team, dtype=np.float32)
+            special_case         = np.zeros(2, dtype=np.float32)
 
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
                 team_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
             for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
                 opponent_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
+
             for i, move in enumerate(battle.available_moves):
                 try:
                     moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power else 0.0
@@ -365,34 +403,36 @@ class InferenceAgent(Player):
                     moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
                 except AssertionError:
                     pass
-            for i, mon in enumerate(battle.team.values()):
-                if mon.fainted: self_team_status[i] = -1.0
-            for i, mon in enumerate(battle.opponent_team.values()):
-                if mon.fainted: opponent_team_status[i] = -1.0
+
+            # FIX: Use National Dex num (via _get_species_num) instead of arbitrary
+            # positional index in full pokedex — mirrors CustomEnv.embed_battle fix.
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                if mon and mon.species:
-                    idx = self._species_to_id.get(mon.species.lower(), 0)
-                    team_identifier[i] = (idx / (len(self._species_to_id) - 1)) * 2 - 1
+                team_identifier[i] = self._get_species_num(mon)
             for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                if mon and mon.species:
-                    idx = self._species_to_id.get(mon.species.lower(), 0)
-                    opponent_identifier[i] = (idx / (len(self._species_to_id) - 1)) * 2 - 1
+                opponent_identifier[i] = self._get_species_num(mon)
+
+            # FIX: Use mon.status.name.lower() not mon.status.value (int) —
+            # matches STATUS_MAP string keys, mirrors CustomEnv.embed_battle fix.
             for i, mon in enumerate(battle.team.values()):
-                status_key = mon.status.value if mon.status else None
+                status_key = mon.status.name.lower() if mon.status else None
                 self_status[i] = STATUS_MAP.get(status_key, 0.0)
             for i, mon in enumerate(battle.opponent_team.values()):
-                status_key = mon.status.value if mon.status else None
+                status_key = mon.status.name.lower() if mon.status else None
                 opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
+
             if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
                 special_case[0] = 1
             if battle.active_pokemon and battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
+            # _encode_active_mon returns 37 dims [hp, type1_onehot(18), type2_onehot(18)]
+            # (status scalar removed — it was a duplicate of own/opp_status_flags)
             active_features     = _encode_active_mon(battle.active_pokemon)
             opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
 
             own_speed = np.float32([self._get_speed(battle.active_pokemon)])
             opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
+
             opp_move_eff = np.zeros(4, dtype=np.float32)
             if battle.opponent_active_pokemon and battle.active_pokemon:
                 for i, move in enumerate(list(battle.opponent_active_pokemon.moves.values())[:4]):
@@ -415,15 +455,20 @@ class InferenceAgent(Player):
 
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
-            opp_alive_flags = _get_opp_alive_flags(battle)
-            own_alive_flags = _get_own_alive_flags(battle)
+            # Explicit alive flags — mirrors embed_battle inline computation
+            own_alive_flags = np.float32(
+                [0.0 if mon.fainted else 1.0 for mon in battle.team.values()]
+                + [1.0] * (6 - len(battle.team))
+            )
+            opp_alive_flags = np.float32(
+                [0.0 if mon.fainted else 1.0 for mon in battle.opponent_team.values()]
+                + [1.0] * (6 - len(battle.opponent_team))
+            )
 
             return np.float32(np.concatenate([
                 moves_base_power,        # 4
                 moves_dmg_multiplier,    # 4
                 moves_pp_ratio,          # 4
-                self_team_status,        # 6
-                opponent_team_status,    # 6
                 team_hp_ratio,           # 6
                 opponent_hp_ratio,       # 6
                 team_identifier,         # 6
@@ -431,8 +476,8 @@ class InferenceAgent(Player):
                 self_status,             # 6
                 opponent_status,         # 6
                 special_case,            # 2
-                active_features,         # 38
-                opp_active_features,     # 38
+                active_features,         # 37
+                opp_active_features,     # 37
                 own_speed,               # 1
                 opp_speed,               # 1
                 opp_move_eff,            # 4
@@ -443,10 +488,10 @@ class InferenceAgent(Player):
                 own_status_flags,        # 5
                 opp_status_flags,        # 5
                 turn_counter,            # 1
-                opp_alive_flags,         # 6
                 own_alive_flags,         # 6
+                opp_alive_flags,         # 6
             ]))
-            # Total: 179
+            # Total: 4+4+4+6+6+6+6+6+6+2+37+37+1+1+4+5+5+1+1+5+5+1+6+6 = 165
 
         except Exception:
             return np.zeros(OBS_SIZE, dtype=np.float32)
@@ -455,10 +500,10 @@ class InferenceAgent(Player):
         action_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.int8)
         if battle.active_pokemon is None:
             return action_mask
-        available_moves = set(battle.available_moves)
+        available_moves   = set(battle.available_moves)
         available_switches = set(battle.available_switches)
         moves = list(battle.active_pokemon.moves.values())
-        team = list(battle.team.values())
+        team  = list(battle.team.values())
         if (len(available_moves) == 0 and len(available_switches) == 0) or battle.active_pokemon.must_recharge:
             action_mask[10] = 1
             return action_mask
@@ -474,15 +519,15 @@ class InferenceAgent(Player):
         return action_mask
 
     def choose_move(self, battle):
-        obs = self._embed(battle)
+        obs  = self._embed(battle)
         mask = self._build_mask(battle)
         action, _ = self._model.predict(obs[np.newaxis, :], action_masks=mask[np.newaxis, :], deterministic=True)
         action = int(action[0])
 
-        available_moves = set(battle.available_moves)
+        available_moves    = set(battle.available_moves)
         available_switches = set(battle.available_switches)
         moves = list(battle.active_pokemon.moves.values()) if battle.active_pokemon else []
-        team = list(battle.team.values())
+        team  = list(battle.team.values())
 
         if action == 10:
             return self.choose_random_move(battle)
@@ -564,7 +609,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             env = CustomEnv(
                 battle_format=battle_format,
                 log_level=30,
-                open_timeout=None,
+                open_timeout=60,
                 strict=False,
                 account_configuration1=agent_config,
                 account_configuration2=opponent_config,
@@ -594,7 +639,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             tensorboard_log="./tensorboard_logs/",
             policy_kwargs=dict(net_arch=NET_ARCH)
         )
-        model.learning_rate = LEARNING_RATE
+        model.learning_rate = linear_lr_schedule(LEARNING_RATE)
         for param_group in model.policy.optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE
         reset_timesteps = False
