@@ -509,6 +509,20 @@ class CustomEnv(SinglesEnv):
     def calc_reward(self, battle) -> float:
         reward = 0.0
 
+        # Normalize perspective: always compute from agent1's point of view.
+        # battle2 is the opponent's mirror — team/opponent_team are swapped there.
+        is_agent_battle = (battle is self.battle1)
+        if is_agent_battle:
+            my_team    = battle.team
+            opp_team   = battle.opponent_team
+            my_active  = battle.active_pokemon
+            opp_active = battle.opponent_active_pokemon
+        else:
+            my_team    = battle.opponent_team
+            opp_team   = battle.team
+            my_active  = battle.opponent_active_pokemon
+            opp_active = battle.active_pokemon
+
         if battle.finished:
             if battle.won is None:
                 terminal = -0.5
@@ -517,13 +531,12 @@ class CustomEnv(SinglesEnv):
             else:
                 terminal = -1.0
             if battle.won:
-                terminal += max(0.0, (80 - battle.turn) / 80) * 0.15 # Bonus for faster wins, up to +0.15 at turn 1, tapering to 0 by turn 80
+                terminal += max(0.0, (80 - battle.turn) / 80) * 0.15
 
             self._terminal_reward = terminal
             self._battle_won = battle.won
 
-            # Only count agent1's battle (not agent2/opponent side)
-            if battle is self.battle1:
+            if is_agent_battle:
                 if battle.won is True:
                     self.eval_wins += 1
                 elif battle.won is False:
@@ -535,8 +548,8 @@ class CustomEnv(SinglesEnv):
             return terminal
 
         # --- KO delta ---
-        opp_fainted_now = sum(p.fainted for p in battle.opponent_team.values())
-        my_fainted_now  = sum(p.fainted for p in battle.team.values())
+        opp_fainted_now = sum(p.fainted for p in opp_team.values())
+        my_fainted_now  = sum(p.fainted for p in my_team.values())
         reward += 0.08 * (opp_fainted_now - self._prev_opp_fainted)
         reward -= 0.08 * (my_fainted_now  - self._prev_my_fainted)
         self._prev_opp_fainted = opp_fainted_now
@@ -544,15 +557,13 @@ class CustomEnv(SinglesEnv):
 
         # --- HP damage delta (per-active-mon, species-gated to avoid switch noise) ---
         HP_CHANGE_THRESHOLD = 0.015
-        opp_active = battle.opponent_active_pokemon
-        own_active  = battle.active_pokemon
         opp_species = opp_active.species if opp_active else None
-        own_species  = own_active.species  if own_active  else None
+        own_species  = my_active.species  if my_active  else None
 
         opp_hp_now = (opp_active.current_hp / opp_active.max_hp
-                      if opp_active and not opp_active.fainted and opp_active.max_hp > 0 else 0.0)
-        own_hp_now  = (own_active.current_hp  / own_active.max_hp
-                       if own_active  and not own_active.fainted  and own_active.max_hp  > 0 else 0.0)
+                    if opp_active and not opp_active.fainted and opp_active.max_hp > 0 else 0.0)
+        own_hp_now  = (my_active.current_hp  / my_active.max_hp
+                    if my_active  and not my_active.fainted  and my_active.max_hp  > 0 else 0.0)
 
         if opp_species == self._prev_active_opp_species and self._prev_active_opp_species is not None:
             opp_hp_lost = max(0.0, self._prev_active_opp_hp - opp_hp_now)
@@ -579,7 +590,6 @@ class CustomEnv(SinglesEnv):
         reward -= 0.003
 
         # Late-game time pressure.
-        # Old formula: -(turn - 20) * 0.02 per step, capped at -0.5.
         if battle.turn > 40:
             reward -= min((battle.turn - 60) * 0.001, 0.05)
 
@@ -590,10 +600,6 @@ class CustomEnv(SinglesEnv):
                 reward -= min(0.005 * (self._deadlock_turns - 5), 0.05)
         else:
             self._deadlock_turns = 0
-
-        # Wasted-switch penalty removed entirely.
-        
-       
 
         return reward
 

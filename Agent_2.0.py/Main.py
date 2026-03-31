@@ -10,9 +10,9 @@ if __name__ == "__main__":
     # Configuration
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league"
-    MODE = "continue"
+    MODE = "new"
     MODEL_NAME     = "Agent5"
-    TRAINING_STEPS = 50000 
+    TRAINING_STEPS = 500000 
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 6

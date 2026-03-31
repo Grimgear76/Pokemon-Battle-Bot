@@ -38,10 +38,7 @@ from environment import (
 # -----------------------------
 def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
     return MaskablePPO(
-        # FIX: ActionMasker wraps the obs space in a Dict to bundle the action mask,
-        # so MlpPolicy raises "You must use MultiInputPolicy". MultiInputPolicy
-        # handles both flat Box and Dict obs spaces correctly.
-        "MultiInputPolicy",
+        "MlpPolicy",  # ActionMasker in this version of sb3_contrib keeps obs as flat Box — MlpPolicy is correct
         env,
         verbose=0,
         learning_rate=linear_lr_schedule(LEARNING_RATE),
@@ -404,15 +401,11 @@ class InferenceAgent(Player):
                 except AssertionError:
                     pass
 
-            # FIX: Use National Dex num (via _get_species_num) instead of arbitrary
-            # positional index in full pokedex — mirrors CustomEnv.embed_battle fix.
             for i, (_, mon) in enumerate(sorted(battle.team.items())):
                 team_identifier[i] = self._get_species_num(mon)
             for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
                 opponent_identifier[i] = self._get_species_num(mon)
 
-            # FIX: Use mon.status.name.lower() not mon.status.value (int) —
-            # matches STATUS_MAP string keys, mirrors CustomEnv.embed_battle fix.
             for i, mon in enumerate(battle.team.values()):
                 status_key = mon.status.name.lower() if mon.status else None
                 self_status[i] = STATUS_MAP.get(status_key, 0.0)
@@ -425,8 +418,6 @@ class InferenceAgent(Player):
             if battle.active_pokemon and battle.active_pokemon.must_recharge:
                 special_case[1] = 1
 
-            # _encode_active_mon returns 37 dims [hp, type1_onehot(18), type2_onehot(18)]
-            # (status scalar removed — it was a duplicate of own/opp_status_flags)
             active_features     = _encode_active_mon(battle.active_pokemon)
             opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
 
@@ -455,7 +446,6 @@ class InferenceAgent(Player):
 
             turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
-            # Explicit alive flags — mirrors embed_battle inline computation
             own_alive_flags = np.float32(
                 [0.0 if mon.fainted else 1.0 for mon in battle.team.values()]
                 + [1.0] * (6 - len(battle.team))
@@ -500,7 +490,7 @@ class InferenceAgent(Player):
         action_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.int8)
         if battle.active_pokemon is None:
             return action_mask
-        available_moves   = set(battle.available_moves)
+        available_moves    = set(battle.available_moves)
         available_switches = set(battle.available_switches)
         moves = list(battle.active_pokemon.moves.values())
         team  = list(battle.team.values())
