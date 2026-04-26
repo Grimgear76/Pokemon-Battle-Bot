@@ -31,6 +31,10 @@ from environment import (
     _encode_boosts,
     _encode_status_flags,
     linear_lr_schedule,
+    _is_move_allowed,
+    _is_asleep,
+    _is_frozen,
+    embed_battle_impl,
 )
 
 # -----------------------------
@@ -113,9 +117,10 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
         policy_kwargs=dict(net_arch=NET_ARCH)
     )
 
-    model.learning_rate = linear_lr_schedule(LEARNING_RATE)
+    model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
     for param_group in model.policy.optimizer.param_groups:
         param_group["lr"] = LEARNING_RATE
+    model.ent_coef = ENT_COEF  # override entropy coef from constants.py (saved model may have stale value)
 
     callbacks = CallbackList([
         ProgressCallback(timesteps, n_envs=n_envs),
@@ -342,149 +347,11 @@ class InferenceAgent(Player):
 
     def _embed(self, battle) -> np.ndarray:
         """
-        Must produce an identical vector to CustomEnv.embed_battle().
-        Layout (165 dims):
-          moves_base_power        4
-          moves_dmg_multiplier    4
-          moves_pp_ratio          4
-          team_hp_ratio           6
-          opponent_hp_ratio       6
-          team_identifier         6
-          opponent_identifier     6
-          self_status             6
-          opponent_status         6
-          special_case            2
-          active_features        37  [hp, type1_onehot(18), type2_onehot(18)]
-          opp_active_features    37
-          own_speed               1
-          opp_speed               1
-          opp_move_eff            4
-          own_boosts              5
-          opp_boosts              5
-          own_item_id             1
-          opp_item_id             1
-          own_status_flags        5
-          opp_status_flags        5
-          turn_counter            1
-          own_alive_flags         6
-          opp_alive_flags         6
+        Inference-side observation builder. Delegates to environment.embed_battle_impl —
+        the SAME function used by training (CustomEnv.embed_battle). This is the only
+        way to guarantee P1 and P2 see byte-identical 165-dim vectors. Do not re-implement.
         """
-        try:
-            moves_n, pokemon_team = 4, 6
-            moves_base_power     = -np.ones(moves_n)
-            moves_dmg_multiplier = np.ones(moves_n)
-            moves_pp_ratio       = np.zeros(moves_n)
-            team_hp_ratio        = np.ones(pokemon_team)
-            opponent_hp_ratio    = np.ones(pokemon_team)
-            team_identifier      = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_identifier  = np.zeros(pokemon_team, dtype=np.float32)
-            self_status          = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_status      = np.zeros(pokemon_team, dtype=np.float32)
-            special_case         = np.zeros(2, dtype=np.float32)
-
-            for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                team_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
-            for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                opponent_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
-
-            for i, move in enumerate(battle.available_moves):
-                try:
-                    moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power else 0.0
-                    if battle.opponent_active_pokemon:
-                        moves_dmg_multiplier[i] = np.clip(
-                            move.type.damage_multiplier(
-                                battle.opponent_active_pokemon.type_1,
-                                battle.opponent_active_pokemon.type_2,
-                                type_chart=self._gen_data.type_chart
-                            ) - 1.0, -1.0, 1.0)
-                    moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
-                except AssertionError:
-                    pass
-
-            for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                team_identifier[i] = self._get_species_num(mon)
-            for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                opponent_identifier[i] = self._get_species_num(mon)
-
-            for i, mon in enumerate(battle.team.values()):
-                status_key = mon.status.name.lower() if mon.status else None
-                self_status[i] = STATUS_MAP.get(status_key, 0.0)
-            for i, mon in enumerate(battle.opponent_team.values()):
-                status_key = mon.status.name.lower() if mon.status else None
-                opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
-
-            if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
-                special_case[0] = 1
-            if battle.active_pokemon and battle.active_pokemon.must_recharge:
-                special_case[1] = 1
-
-            active_features     = _encode_active_mon(battle.active_pokemon)
-            opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
-
-            own_speed = np.float32([self._get_speed(battle.active_pokemon)])
-            opp_speed = np.float32([self._get_speed(battle.opponent_active_pokemon)])
-
-            opp_move_eff = np.zeros(4, dtype=np.float32)
-            if battle.opponent_active_pokemon and battle.active_pokemon:
-                for i, move in enumerate(list(battle.opponent_active_pokemon.moves.values())[:4]):
-                    try:
-                        eff = move.type.damage_multiplier(
-                            battle.active_pokemon.type_1, battle.active_pokemon.type_2,
-                            type_chart=self._gen_data.type_chart)
-                        opp_move_eff[i] = np.clip(eff - 1.0, -1.0, 1.0)
-                    except Exception:
-                        pass
-
-            own_boosts = _encode_boosts(battle.active_pokemon)
-            opp_boosts = _encode_boosts(battle.opponent_active_pokemon)
-
-            own_item_id = np.float32([self._get_item_id(battle.active_pokemon)])
-            opp_item_id = np.float32([self._get_item_id(battle.opponent_active_pokemon)])
-
-            own_status_flags = _encode_status_flags(battle.active_pokemon)
-            opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
-
-            turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
-
-            own_alive_flags = np.float32(
-                [0.0 if mon.fainted else 1.0 for mon in battle.team.values()]
-                + [1.0] * (6 - len(battle.team))
-            )
-            opp_alive_flags = np.float32(
-                [0.0 if mon.fainted else 1.0 for mon in battle.opponent_team.values()]
-                + [1.0] * (6 - len(battle.opponent_team))
-            )
-
-            return np.float32(np.concatenate([
-                moves_base_power,        # 4
-                moves_dmg_multiplier,    # 4
-                moves_pp_ratio,          # 4
-                team_hp_ratio,           # 6
-                opponent_hp_ratio,       # 6
-                team_identifier,         # 6
-                opponent_identifier,     # 6
-                self_status,             # 6
-                opponent_status,         # 6
-                special_case,            # 2
-                active_features,         # 37
-                opp_active_features,     # 37
-                own_speed,               # 1
-                opp_speed,               # 1
-                opp_move_eff,            # 4
-                own_boosts,              # 5
-                opp_boosts,              # 5
-                own_item_id,             # 1
-                opp_item_id,             # 1
-                own_status_flags,        # 5
-                opp_status_flags,        # 5
-                turn_counter,            # 1
-                own_alive_flags,         # 6
-                opp_alive_flags,         # 6
-            ]))
-            # Total: 4+4+4+6+6+6+6+6+6+2+37+37+1+1+4+5+5+1+1+5+5+1+6+6 = 165
-
-        except Exception:
-            return np.zeros(OBS_SIZE, dtype=np.float32)
+        return embed_battle_impl(battle, self._gen_data, self._item_to_id, self._item_count)
 
     def _build_mask(self, battle) -> np.ndarray:
         action_mask = np.zeros(ACTION_SPACE_SIZE, dtype=np.int8)
@@ -497,13 +364,21 @@ class InferenceAgent(Player):
         if (len(available_moves) == 0 and len(available_switches) == 0) or battle.active_pokemon.must_recharge:
             action_mask[10] = 1
             return action_mask
+        own_mon = battle.active_pokemon
+        own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
+        boosts = own_mon.boosts if own_mon.boosts is not None else {}
+        opp_remaining = sum(1 for m in battle.opponent_team.values() if not m.fainted)
         if not battle.force_switch or not battle.active_pokemon.fainted:
             for slot, move in enumerate(moves):
-                if move in available_moves:
+                if move not in available_moves:
+                    continue
+                if _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacitated):
                     action_mask[slot + 6] = 1
-        for slot, mon in enumerate(team):
-            if mon in available_switches:
-                action_mask[slot] = 1
+        allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
+        if allow_switch:
+            for slot, mon in enumerate(team):
+                if mon in available_switches:
+                    action_mask[slot] = 1
         if not any(action_mask):
             action_mask[10] = 1
         return action_mask
@@ -629,9 +504,10 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             tensorboard_log="./tensorboard_logs/",
             policy_kwargs=dict(net_arch=NET_ARCH)
         )
-        model.learning_rate = linear_lr_schedule(LEARNING_RATE)
+        model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
         for param_group in model.policy.optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE
+        model.ent_coef = ENT_COEF  # override entropy coef from constants.py (saved model may have stale value)
         reset_timesteps = False
     else:
         print(f"[League] Creating new model {learner_name}")

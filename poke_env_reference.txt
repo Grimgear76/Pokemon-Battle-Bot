@@ -1,0 +1,148 @@
+POKE-ENV ENVIRONMENT MODULE REFERENCE
+=====================================
+Source: https://poke-env.readthedocs.io/en/stable/modules/env.html
+Last Updated: 2026-04-24
+
+CORE CLASSES
+============
+
+1. PokeEnv (Base Class)
+-----------------------
+The foundational class implementing the PettingZoo API for Pokémon battles on the main thread.
+
+Constructor Parameters:
+  - account_configuration1/2: Player account settings
+  - battle_format: Game format (default: 'gen8randombattle')
+  - team: Team configuration (string or Teambuilder object)
+  - server_configuration: Connection settings
+  - fake: If True, attempt valid outputs even if technically illegal
+  - strict: If True, raise errors on illegal moves; otherwise return defaults
+
+Abstract Methods (must be implemented by subclasses):
+  - action_to_order(): Converts actions to BattleOrder objects
+  - order_to_action(): Converts BattleOrder to actions
+  - calc_reward(): Returns numeric reward for battle state
+  - embed_battle(): Transforms battle state to observation format
+  - get_action_mask(): Returns valid action indicators
+  - get_action_space_size(): Returns total possible actions
+
+Key Methods:
+  - reset(): Initializes environment, returns (observations, info)
+  - step(action): Processes agent actions, returns (observation, reward, terminated, truncated, info)
+  - close(): Cleanup resources
+  - done(): Check completion status
+  - reward_computing_helper(): Utility for reward calculation based on:
+    * HP damage
+    * Fainted Pokémon
+    * Status conditions
+    * Victories
+
+---
+
+2. SinglesEnv (1v1 Battles)
+---------------------------
+Extends PokeEnv for single Pokémon battles.
+
+Action Mapping:
+  -2 to -1: Default/forfeit
+  0-5: Switch Pokémon (6 slots)
+  6-9: Use move (4 moves)
+  10-13: Move + Mega Evolution
+  14-17: Move + Z-Move
+  18-21: Move + Dynamax
+  22-25: Move + Terastallize
+
+Total Actions: 26 possible actions per turn
+
+---
+
+3. DoublesEnv (2v2 Battles)
+---------------------------
+Extends PokeEnv for double battles using numpy arrays as actions.
+
+Features:
+  - Per-Pokémon actions with target selection
+  - Target range: -2 to 2
+  - Accommodates all single battle actions
+  - Supports additional targeting for team coordination
+
+---
+
+4. SingleAgentWrapper
+---------------------
+Wraps PokeEnv for single-agent training against an automated opponent.
+
+The wrapper handles opponent action selection automatically during step() calls.
+
+Interface:
+  - reset(): Returns (observation, info)
+  - step(action): Returns (observation, reward, terminated, truncated, info)
+  - close(): Cleanup
+
+---
+
+TYPICAL USAGE PATTERN
+=====================
+
+from poke_env.env import SinglesEnv
+
+# Create environment
+env = SinglesEnv(battle_format="gen8randombattle")
+
+# Initialize
+obs, info = env.reset()
+
+# Training loop
+for episode in range(num_episodes):
+    action = agent.select_action(obs)
+    obs, reward, done, truncated, info = env.step(action)
+    if done or truncated:
+        obs, info = env.reset()
+
+env.close()
+
+---
+
+KEY IMPLEMENTATION CONSIDERATIONS
+==================================
+
+1. REWARD FUNCTION
+   - Design calc_reward() to incentivize winning strategies
+   - Consider:
+     * HP damage dealt vs received
+     * Pokémon fainted (significant reward)
+     * Status conditions (burn, paralysis, etc.)
+     * Victory bonus
+
+2. OBSERVATION EMBEDDING
+   - embed_battle() transforms battle state to tensor/array format
+   - Must be consistent and feature-rich for agent learning
+   - Typically includes:
+     * Current Pokémon stats
+     * Opponent Pokémon info
+     * Available moves
+     * Team status
+
+3. ACTION MASKING
+   - get_action_mask() critical for:
+     * Preventing illegal moves
+     * Improving sample efficiency
+     * Reducing training time
+   - Only expose valid actions per turn
+
+4. PARAMETER CONFIGURATION
+   - fake=True: Lenient mode (useful for development)
+   - strict=True: Strict mode (recommended for final training)
+   - battle_format: 'gen8randombattle' vs others affects action space
+
+---
+
+AGENT DEVELOPMENT TIPS
+======================
+
+- Use SingleAgentWrapper for straightforward RL training (vs random opponent)
+- Implement proper action masking to improve convergence
+- Design reward function aligned with battle objectives
+- Consider curriculum learning (start with easier formats)
+- Profile reward_computing_helper() for bottlenecks in training loops
+- Test with different battle formats and team compositions

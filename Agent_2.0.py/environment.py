@@ -63,15 +63,16 @@ from poke_env.environment import singles_env as _singles_env_module
 
 _original_order_to_action = _singles_env_module.SinglesEnv.order_to_action
 
-def _patched_order_to_action(self, order, battle, **kwargs):
-    kwargs.pop("strict", None)
-    fake = kwargs.pop("fake", False)
+def _patched_order_to_action(order, battle, fake=False, strict=True):
+    # Must be a staticmethod so instance calls (self.env.order_to_action(...)) do not
+    # prepend the env instance as a spurious first argument — which would cause
+    # AssertionError inside the original, silently caught, and return 10 every time.
     try:
-        return _original_order_to_action(self, order, battle, fake)
+        return _original_order_to_action(order, battle, fake, strict)
     except (ValueError, RecursionError, AssertionError):
         return 10
 
-_singles_env_module.SinglesEnv.order_to_action = _patched_order_to_action
+_singles_env_module.SinglesEnv.order_to_action = staticmethod(_patched_order_to_action)
 
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 
@@ -478,8 +479,8 @@ class CustomEnv(SinglesEnv):
             server_configuration=LocalhostServerConfiguration,
         )
         #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
-        #opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
+        #opponent = RandomPlayer(start_listening=False, account_configuration=opponent_config)
+        opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
         #opponent = SimpleHeuristicsPlayer(start_listening=False, account_configuration=opponent_config)
         #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         base_env = SingleAgentWrapper(env, opponent)
@@ -589,8 +590,8 @@ class CustomEnv(SinglesEnv):
         # --- Small flat time penalty ---
         reward -= 0.003
 
-        # Late-game time pressure.
-        if battle.turn > 40:
+        # Late-game time pressure — only kicks in after turn 60 when the formula is positive.
+        if battle.turn > 60:
             reward -= min((battle.turn - 60) * 0.001, 0.05)
 
         # --- Deadlock penalty ---
@@ -604,112 +605,10 @@ class CustomEnv(SinglesEnv):
         return reward
 
     def embed_battle(self, battle: AbstractBattle):
-        try:
-            assert isinstance(battle, Battle)
-            moves = 4
-            pokemon_team = 6
-            moves_base_power = -np.ones(moves)
-            moves_dmg_multiplier = np.ones(moves)
-            moves_pp_ratio = np.zeros(moves)
-            team_hp_ratio = np.ones(pokemon_team)
-            opponent_hp_ratio = np.ones(pokemon_team)
-            team_identifier = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_identifier = np.zeros(pokemon_team, dtype=np.float32)
-            self_status = np.zeros(pokemon_team, dtype=np.float32)
-            opponent_status = np.zeros(pokemon_team, dtype=np.float32)
-            special_case = np.zeros(2, dtype=np.float32)
-
-            for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                team_hp_ratio[i] = -1.0 if mon.fainted or mon.max_hp == 0 else (mon.current_hp / mon.max_hp) * 2 - 1
-            for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                opponent_hp_ratio[i] = -1.0 if mon.fainted or mon.max_hp == 0 else (mon.current_hp / mon.max_hp) * 2 - 1
-            for i, move in enumerate(battle.available_moves):
-                try:
-                    moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power is not None else 0.0
-                    if battle.opponent_active_pokemon is not None:
-                        moves_dmg_multiplier[i] = np.clip(
-                            move.type.damage_multiplier(
-                                battle.opponent_active_pokemon.type_1,
-                                battle.opponent_active_pokemon.type_2,
-                                type_chart=self.gen_data.type_chart
-                            ) - 1.0, -1.0, 1.0)
-                    moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
-                except AssertionError: pass
-            # Species identifiers — National Dex num from GenData, normalised to [-1, 1]
-            for i, (_, mon) in enumerate(sorted(battle.team.items())):
-                team_identifier[i] = self._get_species_num(mon)
-            for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
-                opponent_identifier[i] = self._get_species_num(mon)
-
-            # FIX: Use mon.status.name.lower() instead of mon.status.value.
-            # In poke-env, Status is an IntEnum so .value returns an integer (e.g. 1),
-            # which never matches the string keys in STATUS_MAP ("brn", "slp", etc.).
-            # This bug caused all status lookups to silently return 0.0 (no status).
-            for i, mon in enumerate(battle.team.values()):
-                status_key = mon.status.name.lower() if mon.status else None
-                self_status[i] = STATUS_MAP.get(status_key, 0.0)
-            for i, mon in enumerate(battle.opponent_team.values()):
-                status_key = mon.status.name.lower() if mon.status else None
-                opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
-
-            if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
-                special_case[0] = 1
-            if battle.active_pokemon.must_recharge:
-                special_case[1] = 1
-
-            # _encode_active_mon returns 37 dims [hp, type1_onehot(18), type2_onehot(18)]
-            active_features     = _encode_active_mon(battle.active_pokemon)
-            opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
-            own_speed    = np.float32([self._get_speed(battle.active_pokemon)])
-            opp_speed    = np.float32([self._get_speed(battle.opponent_active_pokemon)])
-            opp_move_eff = self._get_opp_move_effectiveness(battle)
-            own_boosts   = _encode_boosts(battle.active_pokemon)
-            opp_boosts   = _encode_boosts(battle.opponent_active_pokemon)
-            own_item_id  = np.float32([self._get_item_id(battle.active_pokemon)])
-            opp_item_id  = np.float32([self._get_item_id(battle.opponent_active_pokemon)])
-            own_status_flags = _encode_status_flags(battle.active_pokemon)
-            opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
-            turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
-
-            # Explicit binary alive flags — cleaner than relying on the network to decode
-            # the -1.0 HP sentinel in team_hp_ratio as meaning "fainted".
-            own_alive_flags = np.float32([0.0 if mon.fainted else 1.0
-                                          for mon in battle.team.values()]
-                                         + [1.0] * (6 - len(battle.team)))
-            opp_alive_flags = np.float32([0.0 if mon.fainted else 1.0
-                                          for mon in battle.opponent_team.values()]
-                                         + [1.0] * (6 - len(battle.opponent_team)))
-
-            return np.float32(np.concatenate([
-                moves_base_power,        # 4
-                moves_dmg_multiplier,    # 4
-                moves_pp_ratio,          # 4
-                team_hp_ratio,           # 6
-                opponent_hp_ratio,       # 6
-                team_identifier,         # 6
-                opponent_identifier,     # 6
-                self_status,             # 6
-                opponent_status,         # 6
-                special_case,            # 2
-                active_features,         # 37
-                opp_active_features,     # 37
-                own_speed,               # 1
-                opp_speed,               # 1
-                opp_move_eff,            # 4
-                own_boosts,              # 5
-                opp_boosts,              # 5
-                own_item_id,             # 1
-                opp_item_id,             # 1
-                own_status_flags,        # 5
-                opp_status_flags,        # 5
-                turn_counter,            # 1
-                own_alive_flags,         # 6
-                opp_alive_flags,         # 6
-            ]))
-            # Total: 4+4+4+6+6+6+6+6+6+2+37+37+1+1+4+5+5+1+1+5+5+1+6+6 = 165
-
-        except AssertionError:
-            return np.zeros(OBS_SIZE, dtype=np.float32)
+        # Delegate to the canonical free-function implementation. InferenceAgent._embed
+        # delegates to the same function, guaranteeing byte-identical observations
+        # for training (P1) and inference (P2).
+        return embed_battle_impl(battle, self.gen_data, self._item_to_id, self._item_count)
 
     def reset(self, *args, **kwargs):
         self._reset_battle_tracking()
@@ -776,6 +675,14 @@ def _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacit
         if battle.opponent_active_pokemon.status is not None:
             return False
 
+    # Weather moves: block if the same weather is already active
+    if getattr(move, 'weather', None) is not None and move.weather in battle.weather:
+        return False
+
+    # Curse: block if ATK and DEF are both maxed (checked outside base_power gate for robustness)
+    if move.id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
+        return False
+
     # Stat boost moves: block if the relevant stat is already maxed (+6)
     if move.base_power == 0 or move.base_power is None:
         move_id = move.id
@@ -799,6 +706,165 @@ def _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacit
             return False
 
     return True
+
+
+# -----------------------------
+# Shared embedding helpers (free functions — used by BOTH training (CustomEnv.embed_battle)
+# and inference (InferenceAgent._embed) to guarantee byte-identical observations.
+# Do NOT add a parallel implementation; always call embed_battle_impl from both paths.
+# -----------------------------
+def _get_speed_for(mon, gen_data) -> float:
+    if mon is None or mon.species is None:
+        return 0.0
+    try:
+        speed = gen_data.pokedex[mon.species.lower()]["baseStats"]["spe"]
+        return (speed / MAX_SPEED) * 2 - 1
+    except (KeyError, TypeError):
+        return 0.0
+
+
+def _get_species_num_for(mon, gen_data) -> float:
+    if mon is None or mon.species is None:
+        return 0.0
+    try:
+        num = gen_data.pokedex[mon.species.lower()]["num"]
+        if not (1 <= num <= 251):
+            return 0.0
+        return (num / SPECIES_NUM_SCALE) * 2 - 1
+    except (KeyError, TypeError):
+        return 0.0
+
+
+def _get_item_id_for(mon, item_to_id, item_count) -> float:
+    if mon is None:
+        return 0.0
+    try:
+        item = mon.item
+        if item is None or item == "" or item == "unknown_item":
+            return 0.0
+        item_id = item_to_id.get(item.lower(), 0)
+        if item_id == 0:
+            return 0.0
+        return (item_id / item_count) * 2 - 1
+    except Exception:
+        return 0.0
+
+
+def _get_opp_move_effectiveness_for(battle, gen_data) -> np.ndarray:
+    features = np.zeros(4, dtype=np.float32)
+    if battle.opponent_active_pokemon is None or battle.active_pokemon is None:
+        return features
+    for i, move in enumerate(list(battle.opponent_active_pokemon.moves.values())[:4]):
+        try:
+            eff = move.type.damage_multiplier(
+                battle.active_pokemon.type_1, battle.active_pokemon.type_2,
+                type_chart=gen_data.type_chart)
+            features[i] = np.clip(eff - 1.0, -1.0, 1.0)
+        except (AssertionError, TypeError):
+            features[i] = 0.0
+    return features
+
+
+def embed_battle_impl(battle, gen_data, item_to_id, item_count) -> np.ndarray:
+    """
+    THE canonical 165-dim observation builder. Used by BOTH training (CustomEnv.embed_battle)
+    and inference (InferenceAgent._embed). Any change here applies to both paths automatically.
+
+    Layout (165 dims):
+      moves_base_power 4, moves_dmg_multiplier 4, moves_pp_ratio 4,
+      team_hp_ratio 6, opponent_hp_ratio 6,
+      team_identifier 6, opponent_identifier 6,
+      self_status 6, opponent_status 6, special_case 2,
+      active_features 37, opp_active_features 37,
+      own_speed 1, opp_speed 1, opp_move_eff 4,
+      own_boosts 5, opp_boosts 5,
+      own_item_id 1, opp_item_id 1,
+      own_status_flags 5, opp_status_flags 5,
+      turn_counter 1, own_alive_flags 6, opp_alive_flags 6
+    """
+    try:
+        moves_n, pokemon_team = 4, 6
+        moves_base_power     = -np.ones(moves_n)
+        moves_dmg_multiplier = np.ones(moves_n)
+        moves_pp_ratio       = np.zeros(moves_n)
+        team_hp_ratio        = np.ones(pokemon_team)
+        opponent_hp_ratio    = np.ones(pokemon_team)
+        team_identifier      = np.zeros(pokemon_team, dtype=np.float32)
+        opponent_identifier  = np.zeros(pokemon_team, dtype=np.float32)
+        self_status          = np.zeros(pokemon_team, dtype=np.float32)
+        opponent_status      = np.zeros(pokemon_team, dtype=np.float32)
+        special_case         = np.zeros(2, dtype=np.float32)
+
+        for i, (_, mon) in enumerate(sorted(battle.team.items())):
+            team_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
+        for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
+            opponent_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
+
+        for i, move in enumerate(battle.available_moves):
+            try:
+                moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power is not None else 0.0
+                if battle.opponent_active_pokemon is not None:
+                    moves_dmg_multiplier[i] = np.clip(
+                        move.type.damage_multiplier(
+                            battle.opponent_active_pokemon.type_1,
+                            battle.opponent_active_pokemon.type_2,
+                            type_chart=gen_data.type_chart
+                        ) - 1.0, -1.0, 1.0)
+                moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
+            except AssertionError:
+                pass
+
+        for i, (_, mon) in enumerate(sorted(battle.team.items())):
+            team_identifier[i] = _get_species_num_for(mon, gen_data)
+        for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
+            opponent_identifier[i] = _get_species_num_for(mon, gen_data)
+
+        for i, mon in enumerate(battle.team.values()):
+            status_key = mon.status.name.lower() if mon.status else None
+            self_status[i] = STATUS_MAP.get(status_key, 0.0)
+        for i, mon in enumerate(battle.opponent_team.values()):
+            status_key = mon.status.name.lower() if mon.status else None
+            opponent_status[i] = STATUS_MAP.get(status_key, 0.0)
+
+        if len(battle.available_moves) == 0 and len(battle.available_switches) == 0:
+            special_case[0] = 1
+        if battle.active_pokemon is not None and battle.active_pokemon.must_recharge:
+            special_case[1] = 1
+
+        active_features     = _encode_active_mon(battle.active_pokemon)
+        opp_active_features = _encode_active_mon(battle.opponent_active_pokemon)
+        own_speed    = np.float32([_get_speed_for(battle.active_pokemon, gen_data)])
+        opp_speed    = np.float32([_get_speed_for(battle.opponent_active_pokemon, gen_data)])
+        opp_move_eff = _get_opp_move_effectiveness_for(battle, gen_data)
+        own_boosts   = _encode_boosts(battle.active_pokemon)
+        opp_boosts   = _encode_boosts(battle.opponent_active_pokemon)
+        own_item_id  = np.float32([_get_item_id_for(battle.active_pokemon, item_to_id, item_count)])
+        opp_item_id  = np.float32([_get_item_id_for(battle.opponent_active_pokemon, item_to_id, item_count)])
+        own_status_flags = _encode_status_flags(battle.active_pokemon)
+        opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
+        turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
+
+        own_alive_flags = np.float32([0.0 if mon.fainted else 1.0
+                                      for mon in battle.team.values()]
+                                     + [1.0] * (6 - len(battle.team)))
+        opp_alive_flags = np.float32([0.0 if mon.fainted else 1.0
+                                      for mon in battle.opponent_team.values()]
+                                     + [1.0] * (6 - len(battle.opponent_team)))
+
+        return np.float32(np.concatenate([
+            moves_base_power, moves_dmg_multiplier, moves_pp_ratio,
+            team_hp_ratio, opponent_hp_ratio,
+            team_identifier, opponent_identifier,
+            self_status, opponent_status, special_case,
+            active_features, opp_active_features,
+            own_speed, opp_speed, opp_move_eff,
+            own_boosts, opp_boosts,
+            own_item_id, opp_item_id,
+            own_status_flags, opp_status_flags,
+            turn_counter, own_alive_flags, opp_alive_flags,
+        ]))
+    except Exception:
+        return np.zeros(OBS_SIZE, dtype=np.float32)
 
 
 # -----------------------------
@@ -866,7 +932,7 @@ def linear_lr_schedule(initial_lr: float):
     Pass this as learning_rate= when constructing the PPO model.
     """
     def schedule(progress_remaining: float) -> float:
-        return initial_lr * progress_remaining
+        return max(initial_lr * progress_remaining, initial_lr * 0.05)
     return schedule
 
 
