@@ -331,9 +331,11 @@ class ProgressCallback(BaseCallback):
 # Entropy Monitor Callback
 # -----------------------------
 class EntropyMonitorCallback(BaseCallback):
-    # Threshold raised from 0.5 to 1.0.
-    ENTROPY_THRESHOLD = 1.0
-    ENT_COEF_BOOST = 0.05
+    # Threshold lowered to only fire on real collapse — previously 1.0 sat above the
+    # natural equilibrium entropy (~0.95–1.0), so the boost was permanently on, which
+    # pinned the policy near uniform and prevented commitment to learned moves.
+    ENTROPY_THRESHOLD = 0.3
+    ENT_COEF_BOOST = 0.03
     ENT_COEF_NORMAL = ENT_COEF
 
     def __init__(self, verbose=0):
@@ -404,6 +406,12 @@ class CustomEnv(SinglesEnv):
         self._prev_active_own_species: Optional[str] = None
         self._prev_active_opp_hp: float = 1.0
         self._prev_active_own_hp: float = 1.0
+
+        # Per-species HP memory — credits damage continuously across switches.
+        # Without this, switching after taking damage zeros the species-gated own_hp_lost
+        # signal, letting the agent dodge the negative-HP penalty by spam-switching.
+        self._opp_hp_by_species: Dict[str, float] = {}
+        self._own_hp_by_species: Dict[str, float] = {}
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -498,6 +506,8 @@ class CustomEnv(SinglesEnv):
         self._prev_active_own_species = None
         self._prev_active_opp_hp = 1.0
         self._prev_active_own_hp = 1.0
+        self._opp_hp_by_species = {}
+        self._own_hp_by_species = {}
 
     def _get_team_hp_fraction(self, team) -> float:
         total_current = total_max = 0.0
@@ -566,18 +576,25 @@ class CustomEnv(SinglesEnv):
         own_hp_now  = (my_active.current_hp  / my_active.max_hp
                     if my_active  and not my_active.fainted  and my_active.max_hp  > 0 else 0.0)
 
-        if opp_species == self._prev_active_opp_species and self._prev_active_opp_species is not None:
-            opp_hp_lost = max(0.0, self._prev_active_opp_hp - opp_hp_now)
+        # Use per-species HP memory so switching out then back in still tracks
+        # damage dealt/taken on that mon. Falls back to 1.0 the first time we see
+        # the species (so a fresh-active mon doesn't get spurious damage credit).
+        if opp_species is not None:
+            prev_opp_hp = self._opp_hp_by_species.get(opp_species, 1.0)
+            opp_hp_lost = max(0.0, prev_opp_hp - opp_hp_now)
             opp_hp_actually_dropped = opp_hp_lost > HP_CHANGE_THRESHOLD
             reward += 0.015 * opp_hp_lost
+            self._opp_hp_by_species[opp_species] = opp_hp_now
         else:
             opp_hp_lost = 0.0
             opp_hp_actually_dropped = False
 
-        if own_species == self._prev_active_own_species and self._prev_active_own_species is not None:
-            own_hp_lost = max(0.0, self._prev_active_own_hp - own_hp_now)
+        if own_species is not None:
+            prev_own_hp = self._own_hp_by_species.get(own_species, 1.0)
+            own_hp_lost = max(0.0, prev_own_hp - own_hp_now)
             own_hp_actually_dropped = own_hp_lost > HP_CHANGE_THRESHOLD
             reward -= 0.01 * own_hp_lost
+            self._own_hp_by_species[own_species] = own_hp_now
         else:
             own_hp_lost = 0.0
             own_hp_actually_dropped = False
@@ -696,8 +713,6 @@ def _is_move_allowed(move, own_mon, battle, boosts, opp_remaining, own_incapacit
             return False
         if move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:
             return False
-        if move_id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
-            return False
 
     # Block zero-power moves entirely when incapacitated (asleep or frozen),
     # except Sleep Talk which is the only valid action while asleep.
@@ -800,19 +815,25 @@ def embed_battle_impl(battle, gen_data, item_to_id, item_count) -> np.ndarray:
         for i, (_, mon) in enumerate(sorted(battle.opponent_team.items())):
             opponent_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
 
-        for i, move in enumerate(battle.available_moves):
-            try:
-                moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power is not None else 0.0
-                if battle.opponent_active_pokemon is not None:
-                    moves_dmg_multiplier[i] = np.clip(
-                        move.type.damage_multiplier(
-                            battle.opponent_active_pokemon.type_1,
-                            battle.opponent_active_pokemon.type_2,
-                            type_chart=gen_data.type_chart
-                        ) - 1.0, -1.0, 1.0)
-                moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
-            except AssertionError:
-                pass
+        # Index moves by the active mon's slot order — the SAME order the action layer
+        # (mask + action_to_order) uses. Iterating battle.available_moves instead causes
+        # an index/action mismatch whenever any move is disabled or out of PP.
+        if battle.active_pokemon is not None:
+            own_moves = list(battle.active_pokemon.moves.values())[:moves_n]
+            for i, move in enumerate(own_moves):
+                try:
+                    moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power is not None else 0.0
+                    if battle.opponent_active_pokemon is not None:
+                        moves_dmg_multiplier[i] = np.clip(
+                            move.type.damage_multiplier(
+                                battle.opponent_active_pokemon.type_1,
+                                battle.opponent_active_pokemon.type_2,
+                                type_chart=gen_data.type_chart
+                            ) - 1.0, -1.0, 1.0)
+                    if move.max_pp > 0:
+                        moves_pp_ratio[i] = (move.current_pp / move.max_pp) * 2 - 1
+                except AssertionError:
+                    pass
 
         for i, (_, mon) in enumerate(sorted(battle.team.items())):
             team_identifier[i] = _get_species_num_for(mon, gen_data)
