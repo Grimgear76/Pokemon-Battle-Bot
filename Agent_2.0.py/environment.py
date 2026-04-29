@@ -691,28 +691,7 @@ class CustomEnv(SinglesEnv):
             if voluntary_switch and self._prev_own_pos_boost_sum > 0:
                 reward -= 0.04 * self._prev_own_pos_boost_sum
 
-            # Agent18: removed action-tied switch shaping (consecutive-switch -0.05,
-            # switch-into-better-offense +0.05, switch-into-better-defense +0.05).
-            # Per-step noise from these terms drowned the ±2.0 terminal — Agent17
-            # ep_rew_mean went negative while value fn became confident, indicating
-            # reward-hacking on shaping rather than learning to win. The 712-dim obs
-            # already carries matchup multipliers (Agent13) and bench off/def features
-            # (Agent12) so the value head can learn matchup quality directly. The
-            # passive stay-in-bad-matchup -0.008 below carries the same "don't sit
-            # in a wall" signal from the opposite direction and can't be farmed.
 
-            # Stay-in-bad-matchup penalty. Agent14: cut 0.02 → 0.008. At 0.02/turn it
-            # accumulated faster than the +0.10 KO bonus over even short matchups,
-            # warping gradients toward over-switching (Agent13 logs: Crobat → Misdreavus
-            # vs Murkrow lost a mon to a phantom "matchup" with no real disadvantage).
-            # 0.008 still steers away from genuinely bad stays without dominating.
-            if (not voluntary_switch and not self._last_action_was_switch
-                and my_active is not None and opp_active is not None
-                and not my_active.fainted and not opp_active.fainted):
-                my_off  = _best_off_multiplier(my_active,  opp_active, self.gen_data)
-                opp_off = _best_off_multiplier(opp_active, my_active, self.gen_data)
-                if opp_off >= my_off + 0.5:
-                    reward -= 0.008
 
             # Track voluntary-only switches separately so the consecutive-switch
             # penalty above doesn't fire after forced-on-KO switches.
@@ -730,33 +709,6 @@ class CustomEnv(SinglesEnv):
         self._prev_active_opp_hp      = opp_hp_now
         self._prev_active_own_hp       = own_hp_now
 
-        # --- Small flat time penalty ---
-        # Cut from 0.003 → 0.001: at 0.003/turn, a 40-turn battle accumulated -0.12,
-        # which exceeded the cumulative HP shaping AND rivalled two KOs combined,
-        # warping the gradient toward "end fast" instead of "play well".
-        reward -= 0.001
-
-        # Late-game time pressure — only kicks in after turn 60 when the formula is positive.
-        if battle.turn > 60:
-            reward -= min((battle.turn - 60) * 0.001, 0.05)
-
-        # --- Deadlock penalty ---
-        if not opp_hp_actually_dropped and not own_hp_actually_dropped and not battle.force_switch:
-            self._deadlock_turns += 1
-            if self._deadlock_turns > 5:
-                reward -= min(0.005 * (self._deadlock_turns - 5), 0.05)
-        else:
-            self._deadlock_turns = 0
-
-        # --- Same-move repetition penalty ---
-        # Agent14: only fires when ALSO deadlocked (no HP progress on either side).
-        # The Agent13 schedule punished legitimate Body-Slam-stall vs Dunsparce-style
-        # situations where spamming the same move IS correct (damage was being
-        # dealt and received). Co-gating with deadlock_turns ensures we only
-        # penalise truly stuck loops (e.g. status-spam into a walled mon).
-        if self._consec_same_move > 3 and self._deadlock_turns > 3:
-            excess = self._consec_same_move - 3
-            reward -= min(0.015 * excess, 0.10)
 
         return reward
 
