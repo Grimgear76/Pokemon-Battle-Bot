@@ -1,7 +1,7 @@
 import asyncio
 import multiprocessing
 
-from bot_training import train_new, train_continue, eval_model, eval_model_vs_model, play_vs_human, train_vs_opponent
+from bot_training import train_new, train_continue, eval_model, eval_model_vs_model, play_vs_human, train_vs_opponent, train_self_play
 
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn", force=True)
@@ -9,13 +9,16 @@ if __name__ == "__main__":
     # -----------------------------
     # Configuration
     # -----------------------------
-    # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league"
-    MODE = "eval"
-    MODEL_NAME     = "Agent8"
+    # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league" | "self_play"
+    MODE = "continue"
+    MODEL_NAME     = "Agent19"
     TRAINING_STEPS = 300000
 
+    # Eval opponent: "max" | "heuristic" | "random"
+    EVAL_OPPONENT    = "max"
+
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
-    N_ENVS_RUN  = 6
+    N_ENVS_RUN  = 8
     USE_SUBPROC = True
 
     # Human mode
@@ -34,7 +37,19 @@ if __name__ == "__main__":
     # Eval_vs model mode — head-to-head evaluation between two saved models
     CHALLENGER_NAME  = "Agent5"
     EVAL_VS_OPPONENT = "Agent5Gen2"
-    N_EVAL_BATTLES   = 100
+    N_EVAL_BATTLES   = 200
+
+    # Self-play mode — learner trains against a pool of opponents distributed
+    # round-robin across N_ENVS_RUN. Each entry is one of:
+    #   - "random" / "heuristic" / "max"  → builtin scripted player
+    #   - <model_name>                    → frozen learner from models/<name>.zip
+    # Mix builtins with frozen past learners to anchor against forgetting while
+    # pushing past the ~55%/45% Heuristics/MaxDamage skill ceiling.
+    # NOTE: every entry must use the same OBS_SIZE as the current learner.
+    # Agent14-15 (188 dims) and Agent16-19 (712 dims) are NOT mixable.
+    SELF_PLAY_LEARNER = "Agent19"
+    SELF_PLAY_POOL    = ["Agent16", "Agent17", "Agent18", "heuristic", "max", "max"]
+
 
     # Derive battle format from GEN
     BATTLE_FORMAT = f"gen{GEN}randombattle"
@@ -49,7 +64,7 @@ if __name__ == "__main__":
         train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "eval":
-        eval_model(MODEL_NAME, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT)
+        eval_model(MODEL_NAME, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT, opponent=EVAL_OPPONENT)
 
     elif MODE == "eval_vs":
         eval_model_vs_model(CHALLENGER_NAME, EVAL_VS_OPPONENT, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT)
@@ -59,6 +74,9 @@ if __name__ == "__main__":
 
     elif MODE == "league":
         train_vs_opponent(LEARNER_NAME, OPPONENT_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
+
+    elif MODE == "self_play":
+        train_self_play(SELF_PLAY_LEARNER, TRAINING_STEPS, SELF_PLAY_POOL, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
 
 # -----------------------------
