@@ -14,7 +14,7 @@ SERVER_CONFIG = LocalhostServerConfiguration
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-# OBS_SIZE breakdown (712 total):
+# OBS_SIZE breakdown (794 total):
 #   moves_base_power        4
 #   moves_dmg_multiplier    4
 #   moves_pp_ratio          4
@@ -41,8 +41,8 @@ MODEL_DIR.mkdir(exist_ok=True)
 #   bench_def_vulnerability 6   per-team-slot worst seen-opp-move mult vs that mon's types
 #   matchup_features        3   [own_off, opp_off, diff] for current active matchup
 #   weather                 4   [sun, rain, sand, hail] one-hot
-#   own_side_conditions     3   [spikes, reflect, light_screen] binary
-#   opp_side_conditions     3   [spikes, reflect, light_screen] binary
+#   own_side_conditions     5   [spikes, reflect, light_screen, safeguard, mist] binary (Agent23: +Safeguard +Mist)
+#   opp_side_conditions     5   [spikes, reflect, light_screen, safeguard, mist] binary (Agent23: +Safeguard +Mist)
 #   own_slot_features     252   6 slots × 42 dims [type1_onehot 18, type2_onehot 18, base_stats 6]
 #   opp_slot_features     252   6 slots × 42 dims (zeros for unseen slots)
 #   opp_seen_flags          6   1.0 for slots holding a seen opp mon, 0.0 otherwise
@@ -50,7 +50,14 @@ MODEL_DIR.mkdir(exist_ok=True)
 #   opp_is_active           6   one-hot: which seen-opp slot is the current active mon
 #   force_switch_flag       1   1.0 when battle.force_switch is True
 #   speed_advantage_flag    1   +1/0/-1 for own_eff_speed vs opp_eff_speed
-#                         712
+#   moves_type_onehot      72   4 own moves × 18-dim type one-hot (Agent21)
+#   sleep_counter_own       1   own active sleep turns / 7 (Agent23 — 0 if not asleep)
+#   sleep_counter_opp       1   opp active sleep turns / 7 (Agent23)
+#   toxic_counter_own       1   own active toxic stacks / 15 (Agent23 — 0 if not TOX)
+#   toxic_counter_opp       1   opp active toxic stacks / 15 (Agent23)
+#   substitute_own          1   1.0 if own active is behind a sub (Agent23)
+#   substitute_opp          1   1.0 if opp active is behind a sub (Agent23)
+#                         794
 # Removed: own_item_id, opp_item_id — Gen 2 randombattle uses Leftovers exclusively.
 # Added (Agent12): bench_off_multiplier + bench_def_vulnerability — direct bench-matchup signal.
 # Added (Agent13): matchup_features (current active off/def signal — fixes the no-switch /
@@ -63,7 +70,34 @@ MODEL_DIR.mkdir(exist_ok=True)
 #   that capped earlier agents at ~65/55% WR — the policy now has full type+base-stat
 #   info per bench slot, can distinguish unseen vs seen-and-alive opp mons, and gets
 #   explicit "active is here / forced to switch / I outspeed" signals.
-OBS_SIZE = 712
+# Added (Agent21): moves_type_onehot — explicit 18-dim type for each of 4 own moves.
+#   Earlier agents only saw moves_dmg_multiplier (effectiveness vs CURRENT opp). They
+#   could not reason "if I switch to a Water bench mon, does this move STILL hit hard?"
+#   because move type was never visible — only its effectiveness vs the current matchup.
+#   72 extra dims close that forward-reasoning gap (4 × 18). Appended at the END of the
+#   obs so OWN_SLOT_OFFSET / OPP_SLOT_OFFSET are unchanged and the slot extractor
+#   continues to slice the existing blocks correctly.
+# Added (Agent23): obs space corrections + Gen 2 visibility upgrade.
+#   BUG FIXES (no dim change):
+#     - moves_dmg_multiplier default 1.0 -> 0.0 (was leaking "super-effective" for empty
+#       slots, no-opp scenarios, and silent-asserted moves)
+#     - moves_pp_ratio default 0.0 -> -1.0 (empty slots looked like 50% PP)
+#     - moves_base_power None -> -1.0 (status moves looked like 125 BP attackers)
+#   NEW INFO (+10 dims):
+#     - Safeguard + Mist added to side_conditions (3 -> 5 dims each side, +4)
+#       Both invisible to prior agents; Safeguard counters status leads, Mist counters
+#       stat-drop strats — common in Gen 2 randombattle.
+#     - sleep_counter (own + opp): turns slept / 7. Sleep lasts 1-7 turns; "wakes next
+#       turn" vs "5 more turns asleep" was indistinguishable to prior agents.
+#     - toxic_counter (own + opp): toxic stack / 15. Damage escalates 1/16, 2/16, ...;
+#       a 1-stack vs 8-stack target is a totally different game.
+#     - substitute (own + opp): 1.0 when behind a sub. Sub blocks status, stat changes,
+#       and absorbs HP — bot was completely blind to it (Sub-CM Suicune etc.).
+#   Side-condition expansion shifts OWN_SLOT_OFFSET 188 -> 192 and
+#   OPP_SLOT_OFFSET 440 -> 444. The 6 new active-mon dims are appended at the tail
+#   so the extractor's `tail = obs[:, OPP_SLOT_OFFSET + SLOT_BLOCK_LEN:]` slice
+#   automatically picks them up.
+OBS_SIZE = 794
 
 ACTION_SPACE_SIZE = 11
 
@@ -79,12 +113,15 @@ ACTION_SPACE_SIZE = 11
 # policy stalls" on slot-structured obs (Agent16-18 symptom).
 USE_SLOT_EQUIVARIANT = True
 
-# Slot block layout inside the 712-dim obs (must match embed_battle_impl):
-# offsets are cumulative dim counts up to each slot block.
+# Slot block layout inside the obs (must match embed_battle_impl).
+# Agent23 expands side_conditions 3->5 each side (+4 dims in head), shifting both
+# offsets by +4. New active-mon counters/sub flag (+6 dims) live at the TAIL after
+# moves_type_onehot, so they don't move the slot blocks. Extractor's non_slot_dim
+# is computed dynamically as OBS_SIZE - 2*SLOT_BLOCK_LEN, so the head/tail split adapts.
 N_SLOTS = 6
 SLOT_DIM = 42                  # 18 type1 + 18 type2 + 6 base_stats
-OWN_SLOT_OFFSET = 188          # start of own_slot_features
-OPP_SLOT_OFFSET = 440          # start of opp_slot_features (= 188 + 252)
+OWN_SLOT_OFFSET = 192          # start of own_slot_features (Agent23: 188 + 4 from expanded side_conditions)
+OPP_SLOT_OFFSET = 444          # start of opp_slot_features (= 192 + 252)
 SLOT_BLOCK_LEN = N_SLOTS * SLOT_DIM   # 252
 SLOT_HIDDEN = 32               # per-slot embedding size out of the shared MLP
 
@@ -93,7 +130,8 @@ SLOT_HIDDEN = 32               # per-slot embedding size out of the shared MLP
 # stay stuck at ~0.49 (vs ~0.16 for agents with smaller obs spaces).
 # Each network sees the full features-extractor output and learns its own
 # representation downstream of it. With slot-equivariant extractor the input
-# dim drops from 712 to 208 + 2*6*32 = 592.
+# dim is OBS_SIZE - 504 + 2*6*32 = 280 + 384 = 664 (Agent21, was 592 in Agent20
+# with OBS_SIZE=712).
 # Note: vf_coef only scales the value-net gradient; with separate networks it
 # does NOT touch policy params, so vf_coef=1.0 is safe to combine with this arch.
 # Agent17: wider pi (512→1024 first layer) — Agent16's value fn was excellent
@@ -105,37 +143,49 @@ NET_ARCH = {"pi": [1024, 512, 256], "vf": [512, 256, 128]}
 # FIX: Electrode's base Speed in Gen 2 is 150
 MAX_SPEED = 150
 
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 5e-5
 
 # --- Parallel training config ---
-# N_ENVS is the default; Main.py passes N_ENVS_RUN (currently 6) explicitly.
+# N_ENVS is the default; Main.py passes N_ENVS_RUN (currently 8) explicitly.
 N_ENVS = 4
-# With 6 envs at runtime: 4096 × 6 = 24,576 samples per rollout — better advantage
+# With 8 envs at runtime: 4096 × 8 = 32,768 samples per rollout — better advantage
 # estimation for ~40-turn episodes than the prior 2048×4 = 8192 setup.
 N_STEPS = 4096
 BATCH_SIZE = 512
-N_EPOCHS = 12
-# Agent18: 0.01 → 0.005. Agent17 entropy stayed at -0.73 (vs Agent14's -0.55
-# at peak), policy never committed and ep_rew_mean went negative. Combined with
-# wider pi-net + tight KL/clip, the agent had capacity but no incentive to commit.
-# Halve ent_coef to drop the entropy floor.
-ENT_COEF = 0.005
+N_EPOCHS = 8
+# Agent22: 0.005 → 0.01. Agent21 entropy collapsed to -0.75 while losing
+# (-0.42 reward). With ENT_COEF=0.005 there was almost no pressure to keep
+# exploring — the policy locked into a deterministic losing strategy. Restoring
+# 0.01 adds enough bonus to prevent premature commitment.
+# Agent25: 0.01 → 0.012. Slight exploitation push paired with new reward-shaping
+# signals (immunity penalty, flat voluntary-switch penalty). A24 entropy_loss
+# sat at -0.72 (still very exploratory); the new shaping gives the policy more
+# concrete gradient signal, so a small reduction in exploration pressure should
+# help it commit. Staying well above A18's 0.005 (premature lock-in).
+ENT_COEF = 0.012
 # Raised from 0.5 — across Agent10/11 the value function lagged the policy
 # (value_loss ~0.45, explained_variance trending DOWN toward 0.38 at 3.5M steps
 # even with separated pi/vf nets). Doubling vf_coef gives the value head twice
 # the gradient weight in the combined loss without touching the policy update.
 VF_COEF = 1.0
-# Agent17 continuation: 0.2 → 0.15. At 2.4M steps approx_kl exceeded TARGET_KL=0.02
-# consistently, clip_fraction hit 0.145, and ep_rew_mean last-value cratered to -0.877.
-# The policy was making one too-large step per rollout (before TARGET_KL early-stop fires),
-# destabilising the gradient. Tighter trust region prevents single-epoch overshoot.
-CLIP_RANGE = 0.15
+# Agent21: 0.15 → 0.2 (revert toward Agent14's value).
+# Agent20 ran clip_fraction at 0.22+ against the 0.15 cap — the policy was being
+# clipped on >1 in 5 samples, every rollout. With explained_variance at 0.57 (the
+# best of any agent) and policy_gradient_loss at -0.032 (also strongest), the
+# critic + gradient direction were correct; the trust region was just too tight to
+# act on them. Agent14 (clip=0.2) was the best historical performer; every agent
+# since at 0.15 has done worse. Reverting to 0.2 with the new equivariant arch.
+# Prior context (Agent17 collapse): a single rollout cratered ep_rew_mean to -0.877
+# at 2.4M steps with wider pi + clip 0.2. Agent19+ adds slot-equivariant extractor
+# which makes per-slot reasoning much cheaper, reducing the chance of one-shot
+# blowups in the value head when policy updates loosen.
+CLIP_RANGE = 0.2
 GAE_LAMBDA = 0.92
-# Agent18: 0.02 → 0.03. Agent17 hit approx_kl=0.0176 at 3.4M steps, triggering
-# early-stop nearly every rollout — wider pi [1024,512,256] needed more gradient
-# steps but TARGET_KL was throttling them. Clip 0.15 alone is enough trust-region
-# constraint; loosen the KL cap so the wider net can actually train.
-TARGET_KL = 0.03
+# Agent22: 0.03 → 0.02. Agent21 was hitting approx_kl=0.032–0.038, barely
+# triggering early-stop despite the 0.03 cap — the constraint was too loose to
+# prevent policy thrashing. Agent14's healthy operating range was ~0.013; 0.02
+# matches that without over-throttling the wider pi network.
+TARGET_KL = 0.02
 # Agent19: 0.99 → 0.995. Effective horizon goes from ~100 steps to ~200 steps.
 # Pokemon battles last ~40 turns and setup-then-sweep strategies (Curse,
 # Swords Dance, Belly Drum) take 3-5 turns to pay off. The Agent14-18 pattern

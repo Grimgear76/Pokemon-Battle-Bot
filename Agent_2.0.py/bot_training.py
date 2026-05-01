@@ -8,7 +8,7 @@ from tqdm import tqdm
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import CallbackList
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -29,6 +29,7 @@ from constants import (
 )
 from environment import (
     CustomEnv,
+    MaxDamagePlayer,
     make_vec_env,
     ProgressCallback,
     EntropyMonitorCallback,
@@ -41,6 +42,7 @@ from environment import (
     _is_asleep,
     _is_frozen,
     embed_battle_impl,
+    _RUN_SUFFIX,
 )
 
 # -----------------------------
@@ -50,17 +52,20 @@ class SlotEquivariantExtractor(BaseFeaturesExtractor):
     """
     Slot-equivariant feature extractor for Pokemon obs.
 
-    Splits the 712-dim obs into:
+    Splits the OBS_SIZE-dim obs into:
       - own_slot_features [252]  → 6 slots × 42 dims (type1, type2, base_stats)
       - opp_slot_features [252]  → 6 slots × 42 dims
-      - rest [208]              → all global / active / scalar features
+      - rest [OBS_SIZE - 504]   → all global / active / scalar features
+        (Agent20: 208, Agent21: 280 after appending 72 move-type-onehot dims)
 
     Applies a SHARED 2-layer MLP per slot (42 → SLOT_HIDDEN), encoding each
     Pokemon-slot into the same embedding space regardless of which slot it
     sits in. Concatenates the per-slot embeddings with the rest of the obs.
 
-    Output dim: 208 + 2 * N_SLOTS * SLOT_HIDDEN  (= 208 + 384 = 592 with
-    defaults). The downstream pi/vf MLPs (NET_ARCH) operate on this output.
+    Output dim: (OBS_SIZE - 504) + 2 * N_SLOTS * SLOT_HIDDEN  (= 674 with
+    Agent23 defaults: 794 obs, 290 non-slot + 384 slot embedding; was 664
+    in Agent21, 592 in Agent20). non_slot_dim is computed from
+    observation_space.shape, so this adapts whenever OBS_SIZE changes.
 
     Why: Agent16-18 fed the full 252+252-dim slot blocks into a flat MLP, so
     the policy had to learn a separate 42-dim Pokemon encoding for each of
@@ -91,7 +96,7 @@ class SlotEquivariantExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, obs: th.Tensor) -> th.Tensor:
-        # obs: (B, 712)
+        # obs: (B, OBS_SIZE) — slot offsets unchanged across Agent20/21 (tail grows).
         own_slots = obs[:, OWN_SLOT_OFFSET : OWN_SLOT_OFFSET + SLOT_BLOCK_LEN]
         opp_slots = obs[:, OPP_SLOT_OFFSET : OPP_SLOT_OFFSET + SLOT_BLOCK_LEN]
         # rest = everything OUTSIDE the two slot blocks (head + tail).
@@ -173,12 +178,9 @@ def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc
     train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format, use_opponent_cycle=False)
     model = build_model(train_env, model_name=model_name)
 
-    checkpoint_dir = model_path(model_name).parent / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     callbacks = CallbackList([
         ProgressCallback(timesteps, n_envs=n_envs),
         EntropyMonitorCallback(),
-        CheckpointCallback(save_freq=25_000, save_path=str(checkpoint_dir), name_prefix=model_name),
     ])
 
     model.learn(
@@ -194,15 +196,27 @@ def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc
 # -----------------------------
 # Continue training
 # -----------------------------
-def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
+def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle", opponent: str = "mix"):
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found! Train a new model first.")
         return
 
-    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}")
-    # Continuation uses opponent cycle (Heuristics/MaxDamage) to prevent forgetting
-    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format, use_opponent_cycle=True)
+    from poke_env.player import SimpleHeuristicsPlayer
+
+    opp = opponent.lower()
+    if opp in ("max", "maxdamage"):
+        opp_classes = [MaxDamagePlayer]
+    elif opp in ("heuristic", "heuristics", "simple"):
+        opp_classes = [SimpleHeuristicsPlayer]
+    elif opp == "mix":
+        # 2:1 MaxDamage:Heuristic ratio across envs
+        opp_classes = [MaxDamagePlayer, MaxDamagePlayer, SimpleHeuristicsPlayer]
+    else:
+        raise ValueError(f"Unknown opponent '{opponent}' — expected 'maxdamage', 'heuristic', or 'mix'")
+
+    print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}, opponent={opp}")
+    train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format, use_opponent_cycle=False, opponent_classes=opp_classes)
     # No policy_kwargs override — SB3 reconstructs from the saved metadata so
     # Agent14-18 (flat MLP) and Agent19+ (slot-equivariant extractor) both load
     # correctly through this same code path.
@@ -223,12 +237,9 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
     model.target_kl = TARGET_KL    # override target_kl from constants.py
     model.gamma = GAMMA            # Agent19: 0.99 → 0.995, longer credit assignment
 
-    checkpoint_dir = model_path(model_name).parent / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     callbacks = CallbackList([
         ProgressCallback(timesteps, n_envs=n_envs),
         EntropyMonitorCallback(),
-        CheckpointCallback(save_freq=25_000, save_path=str(checkpoint_dir), name_prefix=model_name),
     ])
 
     model.learn(
@@ -254,18 +265,18 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
         print(f"Model '{model_name}' not found!")
         return
 
-    # Map the string to a use_opponent_cycle flag and a fixed env_id so only
-    # one opponent class is selected: env_id=0 → Heuristics, env_id=1 → MaxDamage.
+    from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
+
     opponent = opponent.lower()
     if opponent in ("max", "maxdamage"):
-        use_cycle, eval_env_id = True, 1   # env_id 1 % 2 = MaxDamage
+        opp_class = MaxDamagePlayer
     elif opponent in ("heuristic", "heuristics", "simple"):
-        use_cycle, eval_env_id = True, 0   # env_id 0 % 2 = Heuristics
+        opp_class = SimpleHeuristicsPlayer
     else:  # "random"
-        use_cycle, eval_env_id = False, 0
+        opp_class = RandomPlayer
 
-    print(f"[Evaluating] model={model_name}, battles={n_battles}, format={battle_format}, opponent={opponent}")
-    eval_env = make_vec_env(n_envs=1, use_subproc=False, battle_format=battle_format, use_opponent_cycle=use_cycle, fixed_env_id=eval_env_id)
+    print(f"[Evaluating] model={model_name}, battles={n_battles}, format={battle_format}, opponent={opp_class.__name__}")
+    eval_env = make_vec_env(n_envs=1, use_subproc=False, battle_format=battle_format, use_opponent_cycle=False, opponent_class=opp_class)
     model = MaskablePPO.load(path, env=eval_env)
 
     wins, losses, draws = 0, 0, 0
@@ -332,8 +343,8 @@ def eval_model_vs_model(
 
     def make_vs_env(env_id: int = 0):
         def _init():
-            agent_config    = AccountConfiguration(f"agent_{env_id}", None)
-            opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
+            agent_config    = AccountConfiguration(f"agt_{env_id}_{_RUN_SUFFIX}", None)
+            opponent_config = AccountConfiguration(f"opp_{env_id}_{_RUN_SUFFIX}", None)
 
             env = CustomEnv(
                 battle_format=battle_format,
@@ -407,7 +418,7 @@ class InferenceAgent(Player):
     """
     Standalone inference player used for model-vs-model eval and human play.
     _embed() must stay in sync with CustomEnv.embed_battle() in environment.py.
-    Current layout: 712 dims (see constants.py OBS_SIZE comment for breakdown).
+    Current layout: 794 dims (see constants.py OBS_SIZE comment for breakdown).
     """
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
@@ -418,7 +429,7 @@ class InferenceAgent(Player):
         """
         Inference-side observation builder. Delegates to environment.embed_battle_impl —
         the SAME function used by training (CustomEnv.embed_battle). This is the only
-        way to guarantee P1 and P2 see byte-identical 712-dim vectors. Do not re-implement.
+        way to guarantee P1 and P2 see byte-identical OBS_SIZE-dim vectors. Do not re-implement.
         """
         return embed_battle_impl(battle, self._gen_data)
 
@@ -428,7 +439,7 @@ class InferenceAgent(Player):
             return action_mask
         available_moves    = set(battle.available_moves)
         available_switches = set(battle.available_switches)
-        moves = list(battle.active_pokemon.moves.values())
+        moves = list(battle.active_pokemon.moves.values())[:4]
         team  = list(battle.team.values())
         if (len(available_moves) == 0 and len(available_switches) == 0) or battle.active_pokemon.must_recharge:
             action_mask[10] = 1
@@ -436,7 +447,7 @@ class InferenceAgent(Player):
         own_mon = battle.active_pokemon
         own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
         boosts = own_mon.boosts if own_mon.boosts is not None else {}
-        if not battle.force_switch or not battle.active_pokemon.fainted:
+        if not battle.force_switch:
             for slot, move in enumerate(moves):
                 if move not in available_moves:
                     continue
@@ -535,9 +546,10 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
     def make_league_env_fn(env_id: int, seed: int = 0):
         def _init():
             set_random_seed(seed + env_id)
+            from environment import _RUN_SUFFIX as _suffix
 
-            agent_config    = AccountConfiguration(f"agent_{env_id}", None)
-            opponent_config = AccountConfiguration(f"Opponent_bot_{env_id}", None)
+            agent_config    = AccountConfiguration(f"agt_{env_id}_{_suffix}", None)
+            opponent_config = AccountConfiguration(f"opp_{env_id}_{_suffix}", None)
 
             env = CustomEnv(
                 battle_format=battle_format,
@@ -574,12 +586,14 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
         model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
         for param_group in model.policy.optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE
-        model.ent_coef = ENT_COEF  # override entropy coef from constants.py (saved model may have stale value)
-        model.vf_coef = VF_COEF    # override vf_coef so value learning gets the updated weight
+        model.ent_coef   = ENT_COEF
+        model.vf_coef    = VF_COEF
         model.gae_lambda = GAE_LAMBDA
-        model.n_epochs = N_EPOCHS
-        model.gamma = GAMMA
-        reset_timesteps = False
+        model.n_epochs   = N_EPOCHS
+        model.clip_range = lambda _: CLIP_RANGE
+        model.target_kl  = TARGET_KL
+        model.gamma      = GAMMA
+        reset_timesteps  = False
     else:
         print(f"[League] Creating new model {learner_name}")
         model = build_model(train_env, model_name=learner_name)
@@ -683,6 +697,7 @@ def train_self_play(
     n_envs: int = N_ENVS,
     use_subproc: bool = True,
     battle_format: str = "gen2randombattle",
+    seed_from: str = None,
 ):
     """
     Train `learner_name` against a pool of opponents distributed round-robin
@@ -730,8 +745,19 @@ def train_self_play(
 
     if learner_path.exists():
         print(f"[SelfPlay] Resuming {learner_name} from checkpoint")
+        load_path = learner_path
+        reset_timesteps = False
+    elif seed_from is not None and model_path(seed_from).exists():
+        print(f"[SelfPlay] Seeding {learner_name} from {seed_from}")
+        load_path = model_path(seed_from)
+        reset_timesteps = True
+    else:
+        load_path = None
+        reset_timesteps = True
+
+    if load_path is not None:
         model = MaskablePPO.load(
-            learner_path,
+            load_path,
             env=train_env,
             tensorboard_log="./tensorboard_logs/",
         )
@@ -745,18 +771,13 @@ def train_self_play(
         model.clip_range = lambda _: CLIP_RANGE
         model.target_kl  = TARGET_KL
         model.gamma      = GAMMA
-        reset_timesteps  = False
     else:
         print(f"[SelfPlay] Creating new model {learner_name}")
         model = build_model(train_env, model_name=learner_name)
-        reset_timesteps = True
 
-    checkpoint_dir = learner_path.parent / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     callbacks = CallbackList([
         ProgressCallback(timesteps, n_envs=n_envs),
         EntropyMonitorCallback(),
-        CheckpointCallback(save_freq=25_000, save_path=str(checkpoint_dir), name_prefix=learner_name),
     ])
 
     model.learn(

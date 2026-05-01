@@ -10,12 +10,17 @@ if __name__ == "__main__":
     # Configuration
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league" | "self_play"
-    MODE = "continue"
-    MODEL_NAME     = "Agent19"
-    TRAINING_STEPS = 300000
+    MODE = "eval"
+    MODEL_NAME     = "Agent24"
+    TRAINING_STEPS = 1000000
+
 
     # Eval opponent: "max" | "heuristic" | "random"
-    EVAL_OPPONENT    = "max"
+    EVAL_OPPONENT    = "heuristic"
+
+    # Continue-training opponent: "maxdamage" | "heuristic" | "mix"
+    # "mix" cycles envs in a 2:1 MaxDamage:Heuristic ratio.
+    CONTINUE_OPPONENT = "mix"
 
     GEN         = 2          # 1 or 2 — controls battle format passed to training functions
     N_ENVS_RUN  = 8
@@ -31,13 +36,13 @@ if __name__ == "__main__":
     #   LEARNER_NAME = "Gen2"  |  OPPONENT_NAME = "ParallelTest8"
     #   next iteration
     #   LEARNER_NAME = "Gen3"  |  OPPONENT_NAME = "Gen2"
-    LEARNER_NAME  = "Agent5"
-    OPPONENT_NAME = "Agent5Gen2"
+    LEARNER_NAME  = "Agent23"
+    OPPONENT_NAME = "Agent23Gen2"
 
     # Eval_vs model mode — head-to-head evaluation between two saved models
-    CHALLENGER_NAME  = "Agent5"
-    EVAL_VS_OPPONENT = "Agent5Gen2"
-    N_EVAL_BATTLES   = 200
+    CHALLENGER_NAME  = "Agent23"
+    EVAL_VS_OPPONENT = "Agent23Gen2"
+    N_EVAL_BATTLES   = 500
 
     # Self-play mode — learner trains against a pool of opponents distributed
     # round-robin across N_ENVS_RUN. Each entry is one of:
@@ -47,8 +52,8 @@ if __name__ == "__main__":
     # pushing past the ~55%/45% Heuristics/MaxDamage skill ceiling.
     # NOTE: every entry must use the same OBS_SIZE as the current learner.
     # Agent14-15 (188 dims) and Agent16-19 (712 dims) are NOT mixable.
-    SELF_PLAY_LEARNER = "Agent19"
-    SELF_PLAY_POOL    = ["Agent16", "Agent17", "Agent18", "heuristic", "max", "max"]
+    SELF_PLAY_LEARNER = "Agent24"
+    SELF_PLAY_POOL    = ["Agent23", "Agent23", "heuristic", "max", "max", "max"]
 
 
     # Derive battle format from GEN
@@ -61,7 +66,7 @@ if __name__ == "__main__":
         train_new(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "continue":
-        train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
+        train_continue(MODEL_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT, opponent=CONTINUE_OPPONENT)
 
     elif MODE == "eval":
         eval_model(MODEL_NAME, n_battles=N_EVAL_BATTLES, battle_format=BATTLE_FORMAT, opponent=EVAL_OPPONENT)
@@ -76,7 +81,7 @@ if __name__ == "__main__":
         train_vs_opponent(LEARNER_NAME, OPPONENT_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "self_play":
-        train_self_play(SELF_PLAY_LEARNER, TRAINING_STEPS, SELF_PLAY_POOL, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
+        train_self_play(SELF_PLAY_LEARNER, TRAINING_STEPS, SELF_PLAY_POOL, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT, seed_from="Agent23")
 
 
 # -----------------------------
