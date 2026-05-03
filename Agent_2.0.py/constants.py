@@ -162,7 +162,12 @@ N_EPOCHS = 8
 # sat at -0.72 (still very exploratory); the new shaping gives the policy more
 # concrete gradient signal, so a small reduction in exploration pressure should
 # help it commit. Staying well above A18's 0.005 (premature lock-in).
-ENT_COEF = 0.012
+# Agent26: 0.012 → 0.008. A25 entropy drifted UP over training (-0.65 → -0.67),
+# evidence that even with the new shaping the policy refused to commit. Combined
+# with hard immune masking + switch-loop guard (which shrink the effective action
+# space), a moderate entropy reduction should push commitment without the A21
+# (0.005) premature collapse.
+ENT_COEF = 0.008
 # Raised from 0.5 — across Agent10/11 the value function lagged the policy
 # (value_loss ~0.45, explained_variance trending DOWN toward 0.38 at 3.5M steps
 # even with separated pi/vf nets). Doubling vf_coef gives the value head twice

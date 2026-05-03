@@ -224,6 +224,7 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
         path,
         env=train_env,
         tensorboard_log="./tensorboard_logs/",
+        custom_objects={"clip_range": lambda _: CLIP_RANGE},
     )
 
     model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
@@ -277,7 +278,7 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
 
     print(f"[Evaluating] model={model_name}, battles={n_battles}, format={battle_format}, opponent={opp_class.__name__}")
     eval_env = make_vec_env(n_envs=1, use_subproc=False, battle_format=battle_format, use_opponent_cycle=False, opponent_class=opp_class)
-    model = MaskablePPO.load(path, env=eval_env)
+    model = MaskablePPO.load(path, env=eval_env, custom_objects={"clip_range": lambda _: CLIP_RANGE})
 
     wins, losses, draws = 0, 0, 0
     pbar = tqdm(total=n_battles, desc="Evaluating", unit="battles")
@@ -339,7 +340,7 @@ def eval_model_vs_model(
         f"battles={n_battles} | format={battle_format}"
     )
 
-    frozen_opponent_model = MaskablePPO.load(opponent_path)
+    frozen_opponent_model = MaskablePPO.load(opponent_path, custom_objects={"clip_range": lambda _: CLIP_RANGE})
 
     def make_vs_env(env_id: int = 0):
         def _init():
@@ -369,7 +370,7 @@ def eval_model_vs_model(
         return _init
 
     eval_env = DummyVecEnv([make_vs_env(env_id=0)])
-    challenger_model = MaskablePPO.load(challenger_path, env=eval_env)
+    challenger_model = MaskablePPO.load(challenger_path, env=eval_env, custom_objects={"clip_range": lambda _: CLIP_RANGE})
 
     wins, losses, draws = 0, 0, 0
     pbar = tqdm(total=n_battles, desc=f"{challenger_name} vs {opponent_name}", unit="battles")
@@ -451,7 +452,7 @@ class InferenceAgent(Player):
             for slot, move in enumerate(moves):
                 if move not in available_moves:
                     continue
-                if _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated):
+                if _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=self._gen_data):
                     action_mask[slot + 6] = 1
         allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
         if allow_switch:
@@ -505,7 +506,7 @@ async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1
         return
 
     print(f"[Human Mode] Loading {model_name}...")
-    model = MaskablePPO.load(path)
+    model = MaskablePPO.load(path, custom_objects={"clip_range": lambda _: CLIP_RANGE})
 
     agent = AsyncInferenceAgent(
         model=model,
@@ -541,7 +542,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
 
     print(f"[League] {learner_name} vs {opponent_name} | timesteps={timesteps:,} | n_envs={n_envs} | format={battle_format}")
 
-    frozen_opponent_model = MaskablePPO.load(opponent_path)
+    frozen_opponent_model = MaskablePPO.load(opponent_path, custom_objects={"clip_range": lambda _: CLIP_RANGE})
 
     def make_league_env_fn(env_id: int, seed: int = 0):
         def _init():
@@ -582,6 +583,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             learner_path,
             env=train_env,
             tensorboard_log="./tensorboard_logs/",
+            custom_objects={"clip_range": lambda _: CLIP_RANGE},
         )
         model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
         for param_group in model.policy.optimizer.param_groups:
@@ -675,7 +677,7 @@ def _make_self_play_env_fn(
         else:
             # Frozen learner — load with NO policy_kwargs override so any saved arch
             # (Agent14-18 flat MLP, Agent19+ slot-equivariant) reconstructs cleanly.
-            opp_model = MaskablePPO.load(opp_path)
+            opp_model = MaskablePPO.load(opp_path, custom_objects={"clip_range": lambda _: CLIP_RANGE})
             opponent = InferenceAgent(
                 model=opp_model,
                 battle_format=battle_format,
@@ -760,6 +762,7 @@ def train_self_play(
             load_path,
             env=train_env,
             tensorboard_log="./tensorboard_logs/",
+            custom_objects={"clip_range": lambda _: CLIP_RANGE},
         )
         model.learning_rate = LEARNING_RATE
         for param_group in model.policy.optimizer.param_groups:

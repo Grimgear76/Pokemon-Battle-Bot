@@ -11,8 +11,8 @@ if __name__ == "__main__":
     # -----------------------------
     # Modes: "new" | "continue" | "eval" | "eval_vs" | "human" | "league" | "self_play"
     MODE = "eval"
-    MODEL_NAME     = "Agent24"
-    TRAINING_STEPS = 1000000
+    MODEL_NAME     = "Agent28"
+    TRAINING_STEPS = 3500000
 
 
     # Eval opponent: "max" | "heuristic" | "random"
@@ -52,8 +52,11 @@ if __name__ == "__main__":
     # pushing past the ~55%/45% Heuristics/MaxDamage skill ceiling.
     # NOTE: every entry must use the same OBS_SIZE as the current learner.
     # Agent14-15 (188 dims) and Agent16-19 (712 dims) are NOT mixable.
-    SELF_PLAY_LEARNER = "Agent24"
-    SELF_PLAY_POOL    = ["Agent23", "Agent23", "heuristic", "max", "max", "max"]
+    SELF_PLAY_LEARNER = "Agent28"
+    # A28 pool: same as A27. A23 as strong modern baseline, A26 for self-play
+    # diversity (immune masking baked in). Two heuristic slots target the
+    # passivity bottleneck (heuristic punishes stalling better than max-damage).
+    SELF_PLAY_POOL    = ["Agent23", "Agent26", "heuristic", "heuristic", "max", "max"]
 
 
     # Derive battle format from GEN
@@ -81,7 +84,7 @@ if __name__ == "__main__":
         train_vs_opponent(LEARNER_NAME, OPPONENT_NAME, TRAINING_STEPS, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT)
 
     elif MODE == "self_play":
-        train_self_play(SELF_PLAY_LEARNER, TRAINING_STEPS, SELF_PLAY_POOL, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT, seed_from="Agent23")
+        train_self_play(SELF_PLAY_LEARNER, TRAINING_STEPS, SELF_PLAY_POOL, n_envs=N_ENVS_RUN, use_subproc=USE_SUBPROC, battle_format=BATTLE_FORMAT, seed_from="Agent26")
 
 
 # -----------------------------

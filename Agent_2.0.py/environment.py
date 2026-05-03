@@ -403,6 +403,11 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
         self._last_action_was_switch: bool = False
+        # Agent26: count consecutive voluntary switches. mask_env uses this to
+        # hard-block a switch on turn N if turns N-1 and N-2 were both voluntary
+        # switches — prevents pivot-loop equilibria (Blissey↔Stantler etc.) that
+        # the A25 soft -0.01 voluntary-switch penalty failed to break.
+        self._consec_voluntary_switches: int = 0
         self._terminal_reward: Optional[float] = None
         self._battle_won: Optional[bool] = None
 
@@ -434,6 +439,12 @@ class CustomEnv(SinglesEnv):
         # signal, letting the agent dodge the negative-HP penalty by spam-switching.
         self._opp_hp_by_species: Dict[str, float] = {}
         self._own_hp_by_species: Dict[str, float] = {}
+
+        # A28: no-progress decay state — counts consecutive turns where neither
+        # side's total team HP fraction changes by >= STALE_THRESHOLD.
+        self._stale_turns: int = 0
+        self._own_team_hp_prev: float = 1.0
+        self._opp_team_hp_prev: float = 1.0
 
     def action_to_order(self, action, battle, fake=False, strict=True):
         if action == 10:
@@ -527,11 +538,15 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted = 0
         self._prev_my_fainted = 0
         self._last_action_was_switch = False
+        self._consec_voluntary_switches = 0
         self._terminal_reward = None
         self._battle_won = None
         self._prev_active_own_species = None
         self._opp_hp_by_species = {}
         self._own_hp_by_species = {}
+        self._stale_turns = 0
+        self._own_team_hp_prev = 1.0
+        self._opp_team_hp_prev = 1.0
         self._last_move_action = -1
         self._consec_same_move = 0
         self._last_action_was_move = False
@@ -638,40 +653,45 @@ class CustomEnv(SinglesEnv):
                 reward -= 0.04 * own_hp_lost
             self._own_hp_by_species[own_species] = own_hp_now
 
-        # --- Switch-pattern penalties (gated to agent perspective so per-step state
-        # mutations happen exactly once even if calc_reward is called for both battles) ---
+        # --- Switch-pattern penalties + trajectory shaping (gated to agent perspective
+        # so per-step state mutations happen exactly once even if calc_reward is
+        # called for both battles) ---
         if is_agent_battle:
-            # Agent25: immunity / very-low-effectiveness penalty.
-            # Detects when the agent picked a damaging move whose type was
-            # 0x or <=0.25x against the opp active. Deterministic from type
-            # chart — no risk of farming, no false positives from RNG misses
-            # (we gate on type multiplier, not on opp HP change).
-            if (self._last_action_was_move and self._last_move_used is not None
-                    and opp_active is not None):
-                bp = getattr(self._last_move_used, "base_power", None)
-                if bp and bp > 0:
-                    try:
-                        mult = self._last_move_used.type.damage_multiplier(
-                            opp_active.type_1,
-                            opp_active.type_2,
-                            type_chart=self.gen_data.type_chart,
-                        )
-                    except (AssertionError, TypeError, AttributeError):
-                        mult = 1.0
-                    if mult == 0.0:
-                        reward -= 0.02
-                        self._consec_ineffective += 1
-                    elif mult <= 0.25:
-                        reward -= 0.005
-                        self._consec_ineffective += 1
-                    else:
-                        self._consec_ineffective = 0
-                    if self._consec_ineffective >= 2:
-                        reward -= 0.01 * (self._consec_ineffective - 1)
-                else:
-                    self._consec_ineffective = 0
+            # Agent26: immunity penalty removed — hard action masking in mask_env
+            # makes it unreachable. Keeping _consec_ineffective reset so the field
+            # stays consistent if loaded from an A25 checkpoint.
+            self._consec_ineffective = 0
+
+            # --- A28: No-progress decay ---
+            # Track total team HP fraction for both sides. If neither moves by
+            # STALE_THRESHOLD for STALE_GRACE consecutive turns, apply a flat
+            # penalty per stale turn. Resets on any meaningful HP change or KO.
+            # Operates at team level — catches switching loops where the active-mon
+            # HP delta (+/-0.04) never fires because nobody takes damage.
+            # A27 proved this signal works (ep_len dropped to 41.25).
+            # A27 also had matchup-quality reward (A26) + tempo reward — both
+            # removed for A28: they created conflicting per-turn gradients that
+            # pushed the policy into a confident-but-wrong local optimum
+            # (entropy collapsed, ep_len crept back up, reward stayed negative).
+            STALE_THRESHOLD = 0.015  # ~1 mon taking 9% on a 6-mon team
+            STALE_GRACE     = 4      # free stale turns (covers Curse/SD setup turns)
+            STALE_PENALTY   = 0.008  # per stale turn after grace period
+
+            own_team_hp = self._get_team_hp_fraction(my_team)
+            opp_team_hp = self._get_team_hp_fraction(opp_team)
+
+            own_hp_delta = abs(own_team_hp - self._own_team_hp_prev)
+            opp_hp_delta = abs(opp_team_hp - self._opp_team_hp_prev)
+
+            if max(own_hp_delta, opp_hp_delta) < STALE_THRESHOLD:
+                self._stale_turns += 1
+                if self._stale_turns > STALE_GRACE:
+                    reward -= STALE_PENALTY
             else:
-                self._consec_ineffective = 0
+                self._stale_turns = 0
+
+            self._own_team_hp_prev = own_team_hp
+            self._opp_team_hp_prev = opp_team_hp
 
             own_species_changed = (
                 own_species is not None
@@ -771,6 +791,13 @@ class CustomEnv(SinglesEnv):
         else:
             raw_action = action
         self._last_action_was_switch = raw_action in range(0, 6)
+        # Agent26: only count voluntary switches (not forced switches after KO).
+        # This counter is read by mask_env on the next decision step.
+        is_forced = self.battle1 is not None and getattr(self.battle1, "force_switch", False)
+        if self._last_action_was_switch and not is_forced:
+            self._consec_voluntary_switches += 1
+        else:
+            self._consec_voluntary_switches = 0
         # Track move repetition (move slots 6-9; ignore switches and default action 10)
         if 6 <= raw_action <= 9:
             if raw_action == self._last_move_action:
@@ -817,7 +844,28 @@ def _get_custom_env(env) -> Optional[CustomEnv]:
 # -----------------------------
 # Move allow helper (used by mask_env)
 # -----------------------------
-def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated) -> bool:
+def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=None) -> bool:
+    # Agent26: hard immune-move masking. Damaging moves with 0× type effectiveness
+    # vs the opponent active are removed entirely from the action space (was a
+    # soft penalty in A25 — A25 entropy drifted UP, evidence the soft signal was
+    # insufficient). Skip when gen_data is None (backward compat) or when the
+    # opponent active is unknown.
+    if (
+        gen_data is not None
+        and move.base_power and move.base_power > 0
+        and battle.opponent_active_pokemon is not None
+    ):
+        try:
+            mult = move.type.damage_multiplier(
+                battle.opponent_active_pokemon.type_1,
+                battle.opponent_active_pokemon.type_2,
+                type_chart=gen_data.type_chart,
+            )
+            if mult == 0:
+                return False
+        except (AssertionError, TypeError):
+            pass
+
     # Sleep Talk only usable while asleep
     if move.id == "sleeptalk" and not _is_asleep(own_mon):
         return False
@@ -1537,6 +1585,7 @@ def mask_env(env):
     own_mon = battle.active_pokemon
     own_incapacitated = _is_asleep(own_mon) or _is_frozen(own_mon)
     boosts = own_mon.boosts if own_mon.boosts is not None else {}
+    gen_data = getattr(env.env, "gen_data", None)
 
     # --- Build move mask ---
     # Old condition was `not force_switch OR not active.fainted` — i.e. only
@@ -1547,12 +1596,25 @@ def mask_env(env):
         for slot, move in enumerate(moves):
             if move not in available_moves:
                 continue
-            if _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated):
+            if _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=gen_data):
                 action_mask[slot + move_offset] = 1
+
+    # Agent26: hard switch-loop guard. After 2 consecutive voluntary switches,
+    # block switching on this turn — unless forced (KO replacement) or
+    # incapacitated (asleep/frozen with no available moves) where switching is
+    # the only legal option. Without this, A25 still hit ep_len_mean ~43.5
+    # because the soft -0.01 penalty was dominated by other reward signals.
+    consec_sw = getattr(env.env, "_consec_voluntary_switches", 0)
+    block_voluntary_switch = (
+        consec_sw >= 2
+        and not battle.force_switch
+        and not own_incapacitated
+        and any(action_mask[move_offset:move_offset + 4])
+    )
 
     # --- Build switch mask ---
     allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
-    if allow_switch:
+    if allow_switch and not block_voluntary_switch:
         for slot, mon in enumerate(team):
             if mon in available_switches:
                 action_mask[slot] = 1
