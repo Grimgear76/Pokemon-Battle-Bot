@@ -6,15 +6,7 @@ import time
 import numpy as np
 from typing import Any, Dict, Optional
 
-# Per-process random suffix, generated once when this module is imported.
-# Showdown keeps unfinished battles alive for unregistered guest usernames for a few
-# minutes after disconnect — if a previous run crashed, reusing usernames like
-# "agent_0" causes the new run to re-inherit those zombie battles, which then makes
-# poke-env's reset_battles() raise "Can not reset player's battles while they are
-# still running". A 4-char random suffix per run guarantees fresh usernames.
-# SubprocVecEnv with start_method="spawn" re-imports this module per child, so each
-# subprocess gets its own suffix — agent and opponent within the same subprocess
-# share it (they both come from the same import) and so still pair correctly.
+# Unique per-run suffix prevents zombie-battle collisions when reusing usernames after a crash.
 _RUN_SUFFIX = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
 
 from gymnasium.spaces import Box, Discrete
@@ -36,19 +28,15 @@ from tqdm import tqdm
 from constants import (
     OBS_SIZE, ACTION_SPACE_SIZE, NET_ARCH, MAX_SPEED,
     N_ENVS, N_STEPS, ENT_COEF, STATUS_MAP,
-    SPECIES_NUM_SCALE,
+    SPECIES_NUM_SCALE, ACTION_HISTORY_LEN, N_MOVE_CATEGORIES,
 )
 
-# -----------------------------
-# Logging patches
-# -----------------------------
+# Suppress noisy opponent/agent logs.
 _original_get_logger = logging.getLogger
 
 def _patched_get_logger(name=None):
     logger = _original_get_logger(name)
     name_str = str(name) if name else ""
-    # Match both legacy ("agent_0", "Opponent_bot_0") and new ("agt_0_abcd", "opp_0_abcd")
-    # username schemes so log filtering survives the per-run-suffix rename.
     if name_str.startswith(("opp_", "Opponent_bot")):
         logger.setLevel(logging.CRITICAL)
         logger.propagate = False
@@ -59,9 +47,7 @@ def _patched_get_logger(name=None):
 
 logging.getLogger = _patched_get_logger
 
-# -----------------------------
 # Monkey-patch: Mirror Move assertion bug
-# -----------------------------
 from poke_env.battle import pokemon as _pokemon_module
 
 _original_available_moves_from_request = _pokemon_module.Pokemon.available_moves_from_request
@@ -74,17 +60,12 @@ def _patched_available_moves_from_request(self, request):
 
 _pokemon_module.Pokemon.available_moves_from_request = _patched_available_moves_from_request
 
-# -----------------------------
-# Monkey-patch: order_to_action infinite recursion bug
-# -----------------------------
+# Monkey-patch: order_to_action infinite recursion bug — must be staticmethod.
 from poke_env.environment import singles_env as _singles_env_module
 
 _original_order_to_action = _singles_env_module.SinglesEnv.order_to_action
 
 def _patched_order_to_action(order, battle, fake=False, strict=True):
-    # Must be a staticmethod so instance calls (self.env.order_to_action(...)) do not
-    # prepend the env instance as a spurious first argument — which would cause
-    # AssertionError inside the original, silently caught, and return 10 every time.
     try:
         return _original_order_to_action(order, battle, fake, strict)
     except (ValueError, RecursionError, AssertionError):
@@ -95,9 +76,6 @@ _singles_env_module.SinglesEnv.order_to_action = staticmethod(_patched_order_to_
 logging.getLogger("poke_env.player").setLevel(logging.WARNING)
 
 
-# -----------------------------
-# Status helpers
-# -----------------------------
 def _has_status(mon, status_enum) -> bool:
     if mon is None:
         return False
@@ -126,7 +104,7 @@ def _is_burned(mon) -> bool:
     return _has_status(mon, PokemonStatus.BRN)
 
 def _is_poisoned(mon) -> bool:
-    """Returns True for both regular poison (PSN) and toxic (TOX)."""
+    """True for both PSN and TOX."""
     if mon is None:
         return False
     try:
@@ -142,10 +120,7 @@ def _is_poisoned(mon) -> bool:
     return False
 
 def _encode_status_flags(mon) -> np.ndarray:
-    """
-    Returns a 5-element float32 array of binary status flags:
-    [asleep, frozen, paralyzed, burned, poisoned]
-    """
+    """5-element binary flags: [asleep, frozen, paralyzed, burned, poisoned]."""
     return np.float32([
         1.0 if _is_asleep(mon)    else 0.0,
         1.0 if _is_frozen(mon)    else 0.0,
@@ -156,11 +131,7 @@ def _encode_status_flags(mon) -> np.ndarray:
 
 
 def _encode_boosts(mon) -> np.ndarray:
-    """
-    Returns a 5-element float32 array of stat boosts normalized to [-1, 1]:
-    [atk, def, spe, spa, spd]
-    Returns zeros if mon is None.
-    """
+    """5-element stat boosts normalized to [-1, 1]: [atk, def, spe, spa, spd]."""
     if mon is None:
         return np.zeros(5, dtype=np.float32)
     boosts = mon.boosts if mon.boosts else {}
@@ -173,8 +144,7 @@ def _encode_boosts(mon) -> np.ndarray:
     ])
 
 
-# Canonical Gen 2 type list — 18 types, fixed order for consistent one-hot encoding.
-# Must never be reordered between training runs.
+# Fixed order — must never be reordered between training runs.
 GEN2_TYPES = [
     "Normal", "Fire", "Water", "Electric", "Grass", "Ice",
     "Fighting", "Poison", "Ground", "Flying", "Psychic", "Bug",
@@ -185,7 +155,7 @@ N_TYPES = len(GEN2_TYPES)  # 18
 
 
 def _type_onehot(type_obj) -> np.ndarray:
-    """Return an 18-dim one-hot vector for a poke-env Type object, or all-zeros if None."""
+    """18-dim one-hot for a poke-env Type, or all-zeros if None."""
     vec = np.zeros(N_TYPES, dtype=np.float32)
     if type_obj is None:
         return vec
@@ -196,14 +166,7 @@ def _type_onehot(type_obj) -> np.ndarray:
 
 
 def _encode_active_mon(mon) -> np.ndarray:
-    """
-    Returns a 37-element float32 array:
-      [hp(1), type1_onehot(18), type2_onehot(18)]
-    type2 is all-zeros for mono-type Pokemon.
-
-    Status scalar removed — it was a duplicate of own_status_flags / opp_status_flags
-    already present in the main observation, wasting 2 dimensions per call.
-    """
+    """37-dim: [hp(1), type1_onehot(18), type2_onehot(18)]."""
     hp = np.float32([-1.0 if (mon is None or mon.fainted or mon.max_hp == 0)
                      else (mon.current_hp / mon.max_hp) * 2 - 1])
     type1 = _type_onehot(mon.type_1 if mon is not None else None)
@@ -211,17 +174,31 @@ def _encode_active_mon(mon) -> np.ndarray:
     return np.concatenate([hp, type1, type2])  # 1+18+18 = 37
 
 
-# -----------------------------
-# Max Damage Player
-# -----------------------------
 from poke_env.player import Player
 
+HEURISTIC_LEVEL = 0.50  # Strength of the heuristic 
+
+_orig_heuristic_choose_move = SimpleHeuristicsPlayer.choose_move
+
+def _patched_heuristic_choose_move(self, battle):
+    if HEURISTIC_LEVEL < 1.0 and random.random() > HEURISTIC_LEVEL:
+        options = list(battle.available_moves) + list(battle.available_switches)
+        if options:
+            return self.create_order(random.choice(options))
+    return _orig_heuristic_choose_move(self, battle)
+
+SimpleHeuristicsPlayer.choose_move = _patched_heuristic_choose_move
+
+
+# Scripted opponent that picks the highest-damage move each turn, with 40% random noise
+# to prevent the agent from overfitting to a single deterministic strategy.
 class MaxDamagePlayer(Player):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gen_data = GenData.from_gen(2)
 
     def _is_move_useful(self, move, mon, battle) -> bool:
+        # Blocks clearly wasteful moves: Rest when healthy, status when opp already statused, etc.
         boosts = mon.boosts if mon.boosts is not None else {}
         if move.id == "rest":
             if _is_asleep(mon): return False
@@ -244,6 +221,10 @@ class MaxDamagePlayer(Player):
 
     def choose_move(self, battle):
         mon = battle.active_pokemon
+        if random.random() < 0.4:
+            options = list(battle.available_moves) + list(battle.available_switches)
+            if options:
+                return self.create_order(random.choice(options))
         damaging_moves = [m for m in battle.available_moves if m.base_power and m.base_power > 0]
         if damaging_moves:
             def effective_power(move):
@@ -264,9 +245,7 @@ class MaxDamagePlayer(Player):
         return self.choose_random_move(battle)
 
 
-# -----------------------------
-# Progress Callback
-# -----------------------------
+# Tracks wins/losses per episode and renders a live tqdm progress bar during training.
 class ProgressCallback(BaseCallback):
     def __init__(self, total_timesteps, n_envs=1, verbose=0):
         super().__init__(verbose)
@@ -345,13 +324,10 @@ class ProgressCallback(BaseCallback):
         self.pbar.close()
 
 
-# -----------------------------
-# Entropy Monitor Callback
-# -----------------------------
+# Watches policy entropy each rollout and temporarily raises ent_coef if it collapses,
+# then restores the normal value once entropy recovers. Prevents premature convergence.
 class EntropyMonitorCallback(BaseCallback):
-    # Threshold lowered to only fire on real collapse — previously 1.0 sat above the
-    # natural equilibrium entropy (~0.95–1.0), so the boost was permanently on, which
-    # pinned the policy near uniform and prevented commitment to learned moves.
+    # Fires only on real collapse (< 0.3); boosts ent_coef temporarily then restores.
     ENTROPY_THRESHOLD = 0.3
     ENT_COEF_BOOST = 0.03
     ENT_COEF_NORMAL = ENT_COEF
@@ -379,9 +355,11 @@ class EntropyMonitorCallback(BaseCallback):
         return True
 
 
-# -----------------------------
-# Custom Environment
-# -----------------------------
+# Core training environment. Extends poke-env's SinglesEnv with:
+#   - custom observation builder (embed_battle_impl)
+#   - shaped reward function (KO delta + HP damage delta + switch penalties)
+#   - action masking hooks for illegal/wasteful moves
+#   - per-species HP memory so damage credit persists across switches
 class CustomEnv(SinglesEnv):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -395,58 +373,37 @@ class CustomEnv(SinglesEnv):
         }
         self.gen_data = GenData.from_gen(2)
 
-        # Species encoding: use the built-in National Dex `num` field directly.
-        # No hand-written list needed — GenData.pokedex already has every species.
-        # _get_species_id() normalises num to [-1, 1] over the Gen 1+2 range (1–251).
-        # (Stored on gen_data, which is already initialised above.)
-
         self._prev_opp_fainted: int = 0
         self._prev_my_fainted: int = 0
         self._last_action_was_switch: bool = False
-        # Agent26: count consecutive voluntary switches. mask_env uses this to
-        # hard-block a switch on turn N if turns N-1 and N-2 were both voluntary
-        # switches — prevents pivot-loop equilibria (Blissey↔Stantler etc.) that
-        # the A25 soft -0.01 voluntary-switch penalty failed to break.
+        # mask_env reads this to hard-block a 3rd consecutive voluntary switch.
         self._consec_voluntary_switches: int = 0
         self._terminal_reward: Optional[float] = None
         self._battle_won: Optional[bool] = None
 
-        # Cumulative counters — never reset, read directly by eval_model
+        # Cumulative counters — never reset; read directly by eval_model.
         self.eval_wins: int = 0
         self.eval_losses: int = 0
         self.eval_draws: int = 0
 
         self._prev_active_own_species: Optional[str] = None
-
         self._last_move_action: int = -1
         self._consec_same_move: int = 0
-
-        # Agent25: track the actual Move object the agent picked this step
-        # (set in step() before super().step() runs) so calc_reward can check
-        # type effectiveness against the opp active and penalise immunities /
-        # very-low-multiplier hits. _consec_ineffective scales the penalty for
-        # repeated ineffective picks.
         self._last_action_was_move: bool = False
         self._last_move_used = None
         self._consec_ineffective: int = 0
-
-        # Positive stat-boost sum of own active mon at end of last calc_reward call —
-        # used to detect "wasted setup" (e.g. Curse then immediate switch).
         self._prev_own_pos_boost_sum: float = 0.0
 
-        # Per-species HP memory — credits damage continuously across switches.
-        # Without this, switching after taking damage zeros the species-gated own_hp_lost
-        # signal, letting the agent dodge the negative-HP penalty by spam-switching.
+        # Per-species HP memory so damage credit persists across switches.
         self._opp_hp_by_species: Dict[str, float] = {}
         self._own_hp_by_species: Dict[str, float] = {}
 
-        # A28: no-progress decay state — counts consecutive turns where neither
-        # side's total team HP fraction changes by >= STALE_THRESHOLD.
         self._stale_turns: int = 0
         self._own_team_hp_prev: float = 1.0
         self._opp_team_hp_prev: float = 1.0
 
     def action_to_order(self, action, battle, fake=False, strict=True):
+        # Action 10 is the "default" slot — map to -2 which poke-env treats as choose_random_move/struggle.
         if action == 10:
             action = -2
         return super().action_to_order(action, battle, fake=fake, strict=strict)
@@ -460,11 +417,7 @@ class CustomEnv(SinglesEnv):
         except (KeyError, TypeError): return 0.0
 
     def _get_species_num(self, mon) -> float:
-        """
-        Returns the species National Dex number normalised to [-1, 1] over 1–251.
-        Uses the `num` field from GenData.pokedex — no hand-written species list needed.
-        Unknown species (not in pokedex, or num outside 1–251) return 0.0.
-        """
+        """National Dex num normalized to [-1, 1] over 1–251; unknown → 0.0."""
         if mon is None or mon.species is None:
             return 0.0
         try:
@@ -497,31 +450,21 @@ class CustomEnv(SinglesEnv):
 
     @classmethod
     def create_single_agent_env(cls, config: Dict[str, Any], env_id: int = 0, use_opponent_cycle: bool = True, opponent_class=None) -> SingleAgentWrapper:
-        # Per-run unique usernames — see _RUN_SUFFIX comment near the top of this module.
-        # "agt_<id>_<suffix>" / "opp_<id>_<suffix>" stays well under Showdown's 18-char limit.
+        # Wraps CustomEnv + opponent into a single-agent Gym env with action masking.
+        # Opponent cycles between SimpleHeuristics and MaxDamage across parallel envs
+        # so the agent learns to handle both strategic styles simultaneously.
         agent_config = AccountConfiguration(f"agt_{env_id}_{_RUN_SUFFIX}", None)
         opponent_config = AccountConfiguration(f"opp_{env_id}_{_RUN_SUFFIX}", None)
         env = cls(
             battle_format=config["battle_format"],
             log_level=30,
-            # FIX: open_timeout=None can hang indefinitely if the Showdown server is slow.
             open_timeout=60,
-            # Raised from default 60s — with 6 parallel envs racing to challenge each
-            # other on startup, the Showdown server can be slow enough that the agent
-            # doesn't fill its battle queue within 60s, raising "Agent is not challenging".
-            challenge_timeout=180.0,
+            challenge_timeout=180.0,  # raised to handle slow Showdown startup with many parallel envs
             strict=False,
             account_configuration1=agent_config,
             account_configuration2=opponent_config,
             server_configuration=LocalhostServerConfiguration,
         )
-        #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-        # Opponent selection: use_opponent_cycle controls the strategy.
-        # - use_opponent_cycle=False (new models): all envs use RandomPlayer for
-        #   broad exploration without specialising. Quick baseline.
-        # - use_opponent_cycle=True (continue training): cycle Heuristics/MaxDamage
-        #   across envs so every rollout sees both strong opponents. Prevents
-        #   catastrophic forgetting (Agent13 symptom: high approx_kl + falling ep_rew_mean).
         if opponent_class is not None:
             OpponentClass = opponent_class
         elif use_opponent_cycle:
@@ -530,11 +473,11 @@ class CustomEnv(SinglesEnv):
         else:
             OpponentClass = RandomPlayer
         opponent = OpponentClass(start_listening=False, account_configuration=opponent_config)
-        #------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
         base_env = SingleAgentWrapper(env, opponent)
         return ActionMasker(base_env, mask_env)
 
     def _reset_battle_tracking(self):
+        # Clears all per-battle state. Called at battle start and after a terminal step.
         self._prev_opp_fainted = 0
         self._prev_my_fainted = 0
         self._last_action_was_switch = False
@@ -553,8 +496,10 @@ class CustomEnv(SinglesEnv):
         self._last_move_used = None
         self._consec_ineffective = 0
         self._prev_own_pos_boost_sum = 0.0
+        self._own_last_actions: list = []  # Agent29: own action history (newest first, max 3)
 
     def _get_team_hp_fraction(self, team) -> float:
+        # Aggregate HP ratio across all living team members; fainted mons excluded from denominator.
         total_current = total_max = 0.0
         for mon in team.values():
             if not mon.fainted and mon.max_hp > 0:
@@ -580,9 +525,6 @@ class CustomEnv(SinglesEnv):
             opp_active = battle.active_pokemon
 
         if battle.finished:
-            # Terminal reward boosted (was ±1.0) so winning dominates the gradient.
-            # Prior balance let the policy farm shaping rewards while losing battles
-            # — reward could trend positive while winrate stagnated.
             if battle.won is None:
                 terminal = -1.0
             elif battle.won:
@@ -590,12 +532,8 @@ class CustomEnv(SinglesEnv):
             else:
                 terminal = -2.0
 
-            # BUG FIX: gate _terminal_reward / _battle_won to is_agent_battle.
-            # calc_reward is called for BOTH battles per step. battle.won is
-            # perspective-dependent (battle1.won == True iff agent won;
-            # battle2.won == True iff opponent won), so the second call would
-            # overwrite the agent's terminal with the opponent's, making
-            # ProgressCallback report wins as losses under SubprocVecEnv.
+            # Gate to is_agent_battle: calc_reward is called for both perspectives;
+            # the second call would otherwise overwrite the agent's terminal reward.
             if is_agent_battle:
                 self._terminal_reward = terminal
                 self._battle_won = battle.won
@@ -610,13 +548,7 @@ class CustomEnv(SinglesEnv):
                 self._reset_battle_tracking()
             return terminal
 
-        # --- KO delta ---
-        # Agent14 rebalance: Agent13 had own_hp_lost (0.05) > opp_hp_lost (0.04), so
-        # every even HP trade was net-negative reward. The policy learned to avoid
-        # combat. Restored to opp_hp_lost >= own_hp_lost so successful trades are rewarded.
-        # Agent23+: raised KO weight 0.10 → 0.25. At 0.10, six KOs = 0.6 vs terminal ±2.0
-        # — PPO over-indexed on sparse terminal signal, delaying emergence of offensive play.
-        # At 0.25: six KOs = 1.5, terminal still dominates, but the dense signal arrives sooner.
+        # KO delta
         opp_fainted_now = sum(p.fainted for p in opp_team.values())
         my_fainted_now  = sum(p.fainted for p in my_team.values())
         reward += 0.25 * (opp_fainted_now - self._prev_opp_fainted)
@@ -624,7 +556,7 @@ class CustomEnv(SinglesEnv):
         self._prev_opp_fainted = opp_fainted_now
         self._prev_my_fainted  = my_fainted_now
 
-        # --- HP damage delta (per-active-mon, species-gated to avoid switch noise) ---
+        # HP damage delta — species-gated so switching doesn't reset the signal.
         opp_species = opp_active.species if opp_active else None
         own_species  = my_active.species  if my_active  else None
 
@@ -633,12 +565,7 @@ class CustomEnv(SinglesEnv):
         own_hp_now  = (my_active.current_hp  / my_active.max_hp
                     if my_active  and not my_active.fainted  and my_active.max_hp  > 0 else 0.0)
 
-        # Use per-species HP memory so switching out then back in still tracks
-        # damage dealt/taken on that mon. Agent19: only credit damage if we've
-        # already seen the species — first-sight defaults to recording current HP
-        # without crediting anything. Prior code defaulted prev=1.0, so an opp
-        # mon switched in already at <100% (Sandstorm/Spikes/Leftovers prior turn)
-        # gave a phantom +0.04 * (1 - hp_now) reward the agent didn't earn.
+        # Only credit damage after first sighting to avoid phantom HP reward on switch-in.
         if opp_species is not None:
             if opp_species in self._opp_hp_by_species:
                 opp_hp_lost = max(0.0, self._opp_hp_by_species[opp_species] - opp_hp_now)
@@ -648,62 +575,20 @@ class CustomEnv(SinglesEnv):
         if own_species is not None:
             if own_species in self._own_hp_by_species:
                 own_hp_lost = max(0.0, self._own_hp_by_species[own_species] - own_hp_now)
-                # Agent14: was 0.05 (loss-averse, exceeded opp_hp_lost). Now matches
-                # opp_hp_lost (0.04) so even-trades are net-zero, not net-negative.
                 reward -= 0.04 * own_hp_lost
             self._own_hp_by_species[own_species] = own_hp_now
 
-        # --- Switch-pattern penalties + trajectory shaping (gated to agent perspective
-        # so per-step state mutations happen exactly once even if calc_reward is
-        # called for both battles) ---
+        # Switch penalties — gated to agent perspective so state mutations happen once.
         if is_agent_battle:
-            # Agent26: immunity penalty removed — hard action masking in mask_env
-            # makes it unreachable. Keeping _consec_ineffective reset so the field
-            # stays consistent if loaded from an A25 checkpoint.
             self._consec_ineffective = 0
-
-            # --- A28: No-progress decay ---
-            # Track total team HP fraction for both sides. If neither moves by
-            # STALE_THRESHOLD for STALE_GRACE consecutive turns, apply a flat
-            # penalty per stale turn. Resets on any meaningful HP change or KO.
-            # Operates at team level — catches switching loops where the active-mon
-            # HP delta (+/-0.04) never fires because nobody takes damage.
-            # A27 proved this signal works (ep_len dropped to 41.25).
-            # A27 also had matchup-quality reward (A26) + tempo reward — both
-            # removed for A28: they created conflicting per-turn gradients that
-            # pushed the policy into a confident-but-wrong local optimum
-            # (entropy collapsed, ep_len crept back up, reward stayed negative).
-            STALE_THRESHOLD = 0.015  # ~1 mon taking 9% on a 6-mon team
-            STALE_GRACE     = 4      # free stale turns (covers Curse/SD setup turns)
-            STALE_PENALTY   = 0.008  # per stale turn after grace period
-
-            own_team_hp = self._get_team_hp_fraction(my_team)
-            opp_team_hp = self._get_team_hp_fraction(opp_team)
-
-            own_hp_delta = abs(own_team_hp - self._own_team_hp_prev)
-            opp_hp_delta = abs(opp_team_hp - self._opp_team_hp_prev)
-
-            if max(own_hp_delta, opp_hp_delta) < STALE_THRESHOLD:
-                self._stale_turns += 1
-                if self._stale_turns > STALE_GRACE:
-                    reward -= STALE_PENALTY
-            else:
-                self._stale_turns = 0
-
-            self._own_team_hp_prev = own_team_hp
-            self._opp_team_hp_prev = opp_team_hp
 
             own_species_changed = (
                 own_species is not None
                 and self._prev_active_own_species is not None
                 and own_species != self._prev_active_own_species
             )
-            # Voluntary switch requires:
-            #  1. Active species actually changed
-            #  2. The agent's chosen action this turn was a switch slot (0-5).
-            #     Filters out Whirlwind/Roar phazes and Baton Pass — both change species
-            #     without the agent choosing a switch action, so they should not be penalised.
-            #  3. The previous active is still alive (otherwise it's a forced switch on KO).
+            # Voluntary switch: species changed AND agent chose a switch slot AND prev mon is alive.
+            # Filters out Whirlwind/Roar phazes and forced KO replacements.
             voluntary_switch = False
             if own_species_changed and self._last_action_was_switch:
                 prev_mon = next(
@@ -714,35 +599,16 @@ class CustomEnv(SinglesEnv):
                 if prev_mon is not None and not prev_mon.fainted:
                     voluntary_switch = True
 
-            # Boost retention: voluntary switch abandons stat boosts (Pokemon resets
-            # boosts on switch). Penalises wasted setup like Curse → immediate switch.
-            # Kept in Agent18 — plain game mechanics, not learnable shaping, can't be farmed.
-            if voluntary_switch and self._prev_own_pos_boost_sum > 0:
-                reward -= 0.04 * self._prev_own_pos_boost_sum
-
-            # Agent25: flat voluntary-switch penalty.
-            # A24 ep_len_mean rose to 45 (vs A14's 38) — direct evidence of pivot
-            # oscillation (Blissey↔Stantler, etc). Existing boost-retention penalty
-            # only fires when the leaving mon had positive boosts; the typical pivot
-            # has no boosts and thus no current cost. Flat -0.01 per voluntary switch
-            # makes pivoting net-negative unless it earns a KO (+0.25) or HP gain.
             if voluntary_switch:
                 reward -= 0.01
-
-            if my_active is not None and my_active.boosts:
-                self._prev_own_pos_boost_sum = sum(
-                    max(0, v) for v in my_active.boosts.values()
-                )
-            else:
-                self._prev_own_pos_boost_sum = 0.0
 
         self._prev_active_own_species = own_species
         return reward
 
     def embed_battle(self, battle: AbstractBattle):
-        # Delegate to the canonical free-function implementation. InferenceAgent._embed
-        # delegates to the same function, guaranteeing byte-identical observations
-        # for training (P1) and inference (P2).
+        # Bridge from poke-env's callback to the standalone embed_battle_impl.
+        # Stash action history so embed_battle_impl can read it.
+        battle._own_last_actions = getattr(self, "_own_last_actions", [])
         return embed_battle_impl(battle, self.gen_data)
 
     def reset(self, *args, **kwargs):
@@ -752,11 +618,7 @@ class CustomEnv(SinglesEnv):
             try:
                 return super().reset(*args, **kwargs)
             except (asyncio.TimeoutError, OSError) as e:
-                # On a timeout, poke-env's super().reset() left a challenge task running
-                # in POKE_LOOP and may have populated agent._battles partway. The next
-                # attempt would either issue a duplicate challenge or hit
-                # "Can not reset player's battles while they are still running". Cancel
-                # the dangling task and clear stale state before retrying.
+                # Cancel dangling challenge task and clear stale battle state before retrying.
                 if attempt < max_retries - 1:
                     logging.warning(
                         f"[Env] reset failed (attempt {attempt + 1}/{max_retries}): "
@@ -769,8 +631,6 @@ class CustomEnv(SinglesEnv):
                         except Exception:
                             pass
                         self._challenge_task = None
-                    # Drop any half-formed battle state on both player objects so the
-                    # next reset_battles() sees a clean slate.
                     for player in (getattr(self, "agent1", None), getattr(self, "agent2", None)):
                         if player is not None:
                             try:
@@ -786,13 +646,12 @@ class CustomEnv(SinglesEnv):
         print("[Environment Closed]")
 
     def step(self, action):
+        # Track switch/move stats before forwarding to super — used by mask_env and calc_reward.
         if isinstance(action, dict):
             raw_action = next(iter(action.values()))
         else:
             raw_action = action
         self._last_action_was_switch = raw_action in range(0, 6)
-        # Agent26: only count voluntary switches (not forced switches after KO).
-        # This counter is read by mask_env on the next decision step.
         is_forced = self.battle1 is not None and getattr(self.battle1, "force_switch", False)
         if self._last_action_was_switch and not is_forced:
             self._consec_voluntary_switches += 1
@@ -809,9 +668,6 @@ class CustomEnv(SinglesEnv):
             self._consec_same_move = 0
             self._last_move_action = -1
 
-        # Agent25: capture the actual Move chosen so calc_reward can check
-        # type effectiveness vs opp active. Use the same slot mapping as the
-        # obs builder / mask (line 872, 1325): list(active_pokemon.moves.values())[:4].
         self._last_action_was_move = 6 <= raw_action <= 9
         if self._last_action_was_move and self.battle1 is not None and self.battle1.active_pokemon is not None:
             moves_list = list(self.battle1.active_pokemon.moves.values())[:4]
@@ -819,6 +675,7 @@ class CustomEnv(SinglesEnv):
             self._last_move_used = moves_list[slot] if slot < len(moves_list) else None
         else:
             self._last_move_used = None
+        self._own_last_actions = ([raw_action] + self._own_last_actions)[:ACTION_HISTORY_LEN]
         self._terminal_reward = None
         self._battle_won = None
         obs, reward, terminated, truncated, info = super().step(action)
@@ -830,10 +687,8 @@ class CustomEnv(SinglesEnv):
         return obs, reward, terminated, truncated, info
 
 
-# -----------------------------
-# Wrapper chain walker
-# -----------------------------
 def _get_custom_env(env) -> Optional[CustomEnv]:
+    # Unwraps Monitor/ActionMasker/SingleAgentWrapper layers to reach the inner CustomEnv.
     obj = env
     while obj is not None:
         if isinstance(obj, CustomEnv): return obj
@@ -841,15 +696,10 @@ def _get_custom_env(env) -> Optional[CustomEnv]:
     return None
 
 
-# -----------------------------
-# Move allow helper (used by mask_env)
-# -----------------------------
 def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=None) -> bool:
-    # Agent26: hard immune-move masking. Damaging moves with 0× type effectiveness
-    # vs the opponent active are removed entirely from the action space (was a
-    # soft penalty in A25 — A25 entropy drifted UP, evidence the soft signal was
-    # insufficient). Skip when gen_data is None (backward compat) or when the
-    # opponent active is unknown.
+    # Used by both mask_env (training) and InferenceAgent._build_mask (inference).
+    # Returns False for moves that are illegal, immune, or provably wasteful.
+    # Hard-mask immune moves (0× effectiveness) when gen_data is available.
     if (
         gen_data is not None
         and move.base_power and move.base_power > 0
@@ -866,11 +716,9 @@ def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=
         except (AssertionError, TypeError):
             pass
 
-    # Sleep Talk only usable while asleep
     if move.id == "sleeptalk" and not _is_asleep(own_mon):
         return False
 
-    # Rest: blocked if already asleep, HP too high, or healthy with no status
     if move.id == "rest":
         hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
         if _is_asleep(own_mon):
@@ -880,26 +728,22 @@ def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=
         if own_mon.status is None and hp_ratio > 0.5:
             return False
 
-    # Other healing moves: block at high HP
     if getattr(move, 'heal', 0) and move.id != "rest":
         hp_ratio = own_mon.current_hp / own_mon.max_hp if own_mon.max_hp > 0 else 0
         if hp_ratio > 0.85:
             return False
 
-    # Status moves: block if opponent already has a status condition
     if getattr(move, 'status', None) and battle.opponent_active_pokemon is not None:
         if battle.opponent_active_pokemon.status is not None:
             return False
 
-    # Weather moves: block if the same weather is already active
     if getattr(move, 'weather', None) is not None and move.weather in battle.weather:
         return False
 
-    # Curse: block if ATK and DEF are both maxed (checked outside base_power gate for robustness)
     if move.id == "curse" and boosts.get("atk", 0) >= 6 and boosts.get("def", 0) >= 6:
         return False
 
-    # Stat boost moves: block if the relevant stat is already maxed (+6)
+    # Block stat-boost moves when the relevant stat is already maxed.
     if move.base_power == 0 or move.base_power is None:
         move_id = move.id
         if move_id in ("agility", "rocksmash") and boosts.get("spe", 0) >= 6:
@@ -913,8 +757,7 @@ def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=
         if move_id in ("defensecurl", "harden", "withdraw") and boosts.get("def", 0) >= 6:
             return False
 
-    # Block zero-power moves entirely when incapacitated (asleep or frozen),
-    # except Sleep Talk which is the only valid action while asleep.
+    # Incapacitated (asleep/frozen): block all non-damaging moves except Sleep Talk.
     if own_incapacitated and (move.base_power == 0 or move.base_power is None):
         if move.id != "sleeptalk":
             return False
@@ -922,11 +765,7 @@ def _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=
     return True
 
 
-# -----------------------------
-# Shared embedding helpers (free functions — used by BOTH training (CustomEnv.embed_battle)
-# and inference (InferenceAgent._embed) to guarantee byte-identical observations.
-# Do NOT add a parallel implementation; always call embed_battle_impl from both paths.
-# -----------------------------
+# Shared embedding helpers — used by both training and inference via embed_battle_impl.
 def _get_speed_for(mon, gen_data) -> float:
     if mon is None or mon.species is None:
         return 0.0
@@ -965,19 +804,7 @@ def _get_opp_move_effectiveness_for(battle, gen_data) -> np.ndarray:
 
 
 def _get_own_move_types_for(battle) -> np.ndarray:
-    """
-    Agent21: 72-dim block — 4 own move slots × 18-dim type one-hot. Iterated in
-    the SAME order as moves_base_power / moves_dmg_multiplier / moves_pp_ratio
-    (active_pokemon.moves.values()[:4]) so all four per-move features index
-    consistently. Empty slots (no move present) → all zeros.
-
-    Why: prior obs only carried moves_dmg_multiplier (effectiveness vs CURRENT
-    opp). Without explicit move type, the policy could not predict effectiveness
-    against bench mons or post-switch opponents — type-vs-type lookups were
-    only available for the active matchup. Explicit one-hots let the policy
-    do forward reasoning (e.g. "this Fire move will be resisted by the Water
-    bench mon I'm considering switching into").
-    """
+    """72-dim: 4 move slots × 18-dim type one-hot. Empty slots → zeros."""
     features = np.zeros(4 * N_TYPES, dtype=np.float32)
     if battle.active_pokemon is None:
         return features
@@ -991,13 +818,34 @@ def _get_own_move_types_for(battle) -> np.ndarray:
     return features
 
 
+def _get_own_action_history(battle) -> np.ndarray:
+    """33-dim: last 3 actions × 11-way one-hot (newest first). Unplayed slots → zeros."""
+    history = getattr(battle, "_own_last_actions", [])
+    features = np.zeros(ACTION_HISTORY_LEN * ACTION_SPACE_SIZE, dtype=np.float32)
+    for i, action in enumerate(history[:ACTION_HISTORY_LEN]):
+        if 0 <= action < ACTION_SPACE_SIZE:
+            features[i * ACTION_SPACE_SIZE + action] = 1.0
+    return features
+
+
+def _get_own_move_categories(battle) -> np.ndarray:
+    """12-dim: 4 move slots × 3-dim one-hot [physical, special, status]."""
+    _CAT_IDX = {"physical": 0, "special": 1, "status": 2}
+    features = np.zeros(4 * N_MOVE_CATEGORIES, dtype=np.float32)
+    if battle.active_pokemon is None:
+        return features
+    for i, move in enumerate(list(battle.active_pokemon.moves.values())[:4]):
+        cat = getattr(move, "category", None)
+        if cat is None:
+            continue
+        idx = _CAT_IDX.get(cat.name.lower(), -1)
+        if idx >= 0:
+            features[i * N_MOVE_CATEGORIES + idx] = 1.0
+    return features
+
+
 def _best_off_multiplier(mon, opp, gen_data) -> float:
-    """
-    Best raw damage multiplier among `mon`'s damaging moves vs `opp`'s type pair.
-    Returns 1.0 when there is no info (no opp / no mon / no damaging moves seen).
-    Used by both the obs builder (bench_off_multiplier feature) and the reward
-    function (switch-into-better-matchup bonus) so the two stay consistent.
-    """
+    """Best damage multiplier among mon's moves vs opp's type pair. Returns 1.0 if no info."""
     if mon is None or opp is None:
         return 1.0
     best = 0.0
@@ -1018,12 +866,7 @@ def _best_off_multiplier(mon, opp, gen_data) -> float:
 
 
 def _worst_def_multiplier(mon, opp, gen_data) -> float:
-    """
-    Worst (highest) damage multiplier among `opp`'s *seen* damaging moves vs
-    `mon`'s type pair. Returns 1.0 when no info. Mirrors the per-team
-    bench_def_vulnerability feature — used by the defensive-switch reward
-    so reward and obs share the same matchup view.
-    """
+    """Worst (highest) damage multiplier among opp's seen moves vs mon's type pair."""
     if mon is None or opp is None:
         return 1.0
     worst = 0.0
@@ -1044,12 +887,7 @@ def _worst_def_multiplier(mon, opp, gen_data) -> float:
 
 
 def _get_bench_off_multiplier_for(battle, gen_data) -> np.ndarray:
-    """
-    For each of 6 team slots (insertion order, same as team_hp_ratio etc.), the best
-    damage multiplier among that mon's damaging moves vs the opponent's active type.
-    Encoded as clip(best_mult - 1.0, -1.0, 1.0). Fainted mons → 0.0.
-    Tells the policy "switching to slot k gives a super-effective option."
-    """
+    """6-dim: best offensive mult vs opp active per own slot. clip(mult-1, -1, 1). Fainted → 0."""
     features = np.zeros(6, dtype=np.float32)
     opp = battle.opponent_active_pokemon
     if opp is None:
@@ -1063,13 +901,7 @@ def _get_bench_off_multiplier_for(battle, gen_data) -> np.ndarray:
 
 
 def _get_bench_def_vulnerability_for(battle, gen_data) -> np.ndarray:
-    """
-    For each of 6 team slots (insertion order), the WORST damage multiplier the
-    opponent's *seen* moves achieve vs that mon's type pair. Encoded as
-    clip(worst_mult - 1.0, -1.0, 1.0). Fainted mons → 0.0. Partial info: only
-    seen opponent moves are considered (same convention as opp_move_eff).
-    Tells the policy "switching to slot k will get OHKO'd by a known threat."
-    """
+    """6-dim: worst seen-opp-move mult vs each own slot's types. clip(mult-1, -1, 1). Fainted → 0."""
     features = np.zeros(6, dtype=np.float32)
     opp = battle.opponent_active_pokemon
     if opp is None:
@@ -1099,14 +931,7 @@ def _get_bench_def_vulnerability_for(battle, gen_data) -> np.ndarray:
 
 
 def _encode_slot_features(mon, gen_data) -> np.ndarray:
-    """
-    42-dim per-team-slot rich feature vector:
-      type1_onehot 18, type2_onehot 18, base_stats 6
-        (hp/atk/def/spa/spd/spe normalised to [-1, 1] over 0-255).
-    Returns zeros for None / unknown species — combine with the per-slot seen /
-    alive flags so the network can detect "no info here" instead of treating
-    a zero vector as a real mon.
-    """
+    """42-dim: [type1_onehot 18, type2_onehot 18, base_stats 6 normalized to [-1,1]]. None → zeros."""
     if mon is None or mon.species is None:
         return np.zeros(42, dtype=np.float32)
     type1 = _type_onehot(mon.type_1)
@@ -1126,14 +951,7 @@ def _encode_slot_features(mon, gen_data) -> np.ndarray:
 
 
 def _get_team_slot_features(battle, gen_data) -> np.ndarray:
-    """
-    252-dim flat vector: 6 own-team slots × 42 dims, insertion order so slot k
-    here corresponds to switch action k. Earlier obs only carried a single
-    species_num scalar per slot — agents below Agent16 had to derive every
-    bench mon's role from one nearly-arbitrary number on the dex axis, which
-    capped policy quality at the heuristic-tier (~65% / 55% WR). Per-slot
-    types + base stats give the policy actual identity for every bench mon.
-    """
+    """252-dim: 6 own-team slots × 42 dims, insertion order matching switch actions."""
     features = np.zeros(6 * 42, dtype=np.float32)
     for i, mon in enumerate(list(battle.team.values())[:6]):
         features[i * 42:(i + 1) * 42] = _encode_slot_features(mon, gen_data)
@@ -1141,11 +959,7 @@ def _get_team_slot_features(battle, gen_data) -> np.ndarray:
 
 
 def _get_opp_slot_features(battle, gen_data) -> np.ndarray:
-    """
-    252-dim flat vector for the opponent team in DISCOVERY order. Unseen slots
-    are zero — pair with opp_seen_flags so the policy can distinguish
-    "nothing here yet" from a real seen mon with all-zero stats.
-    """
+    """252-dim: opponent team in discovery order. Unseen slots → zeros (pair with opp_seen_flags)."""
     features = np.zeros(6 * 42, dtype=np.float32)
     for i, mon in enumerate(list(battle.opponent_team.values())[:6]):
         features[i * 42:(i + 1) * 42] = _encode_slot_features(mon, gen_data)
@@ -1153,13 +967,7 @@ def _get_opp_slot_features(battle, gen_data) -> np.ndarray:
 
 
 def _get_opp_seen_flags(battle) -> np.ndarray:
-    """
-    1.0 for slots that hold a seen opp mon, 0.0 for slots not yet revealed.
-    Earlier agents padded opp_alive_flags with 1.0 for unseen slots, which made
-    "5 unseen opps" indistinguishable from "5 healthy seen opps" — endgame mon
-    counting was effectively blind. opp_seen_flags closes that gap and
-    opp_alive_flags is now 1.0 only for SEEN-AND-ALIVE.
-    """
+    """6-dim: 1.0 for revealed opp slots, 0.0 for unseen."""
     flags = np.zeros(6, dtype=np.float32)
     n_seen = min(len(battle.opponent_team), 6)
     flags[:n_seen] = 1.0
@@ -1193,19 +1001,14 @@ def _get_opp_is_active(battle) -> np.ndarray:
 
 
 def _boost_mult(b: int) -> float:
-    """Stat-boost speed multiplier — Gen-2 standard: +b → (2+b)/2, -b → 2/(2-b)."""
+    """Gen 2 stat-boost multiplier: +b → (2+b)/2, -b → 2/(2-b)."""
     if b >= 0:
         return (2 + b) / 2.0
     return 2.0 / (2 - b)
 
 
 def _get_speed_advantage(battle, gen_data) -> np.ndarray:
-    """
-    Single scalar in {+1, 0, -1} for who outspeeds, accounting for stat boosts
-    and paralysis (which quarters speed in Gen 2). Saves the value head from
-    deriving "I move first" out of base speeds + boosts + status flags every
-    step — a strong signal for switch / status / setup decisions.
-    """
+    """+1/0/-1 scalar for who outspeeds, accounting for boosts and paralysis."""
     own = battle.active_pokemon
     opp = battle.opponent_active_pokemon
     if own is None or opp is None or own.species is None or opp.species is None:
@@ -1234,18 +1037,7 @@ def _get_speed_advantage(battle, gen_data) -> np.ndarray:
 
 
 def _get_matchup_features_for(battle, gen_data) -> np.ndarray:
-    """
-    Three-scalar summary of the current active-vs-active matchup. Without this,
-    Agent12 had to derive matchup quality from raw type one-hots every step —
-    which produced the no-switch behaviour seen in battle logs (Quagsire staying
-    in vs Kingdra Surf, Mewtwo eating two Earthquakes from Gligar at low HP).
-
-    Returns:
-      [own_off_advantage, opp_off_advantage, matchup_diff]
-        own_off_advantage : clip(my_best_off_mult  - 1.0, -1, 1)
-        opp_off_advantage : clip(opp_best_off_mult - 1.0, -1, 1)
-        matchup_diff      : clip((own - opp) / 2.0, -1, 1)   (>0 = we are favoured)
-    """
+    """3-dim: [own_off_advantage, opp_off_advantage, matchup_diff] for the active matchup."""
     own = battle.active_pokemon
     opp = battle.opponent_active_pokemon
     if own is None or opp is None:
@@ -1259,7 +1051,6 @@ def _get_matchup_features_for(battle, gen_data) -> np.ndarray:
     ])
 
 
-# Weather encoding — only the four weathers that exist in Gen 2.
 _WEATHER_TO_IDX = {
     Weather.SUNNYDAY:  0,
     Weather.RAINDANCE: 1,
@@ -1281,13 +1072,7 @@ def _encode_weather_for(battle) -> np.ndarray:
 
 
 def _encode_side_conditions_for(side_conditions) -> np.ndarray:
-    """
-    Five-binary flags: [spikes, reflect, light_screen, safeguard, mist]. Gen 2
-    has single-layer Spikes; Reflect/Light Screen halve physical/special damage
-    for 5 turns. Agent23: added Safeguard (blocks all status moves for 5 turns —
-    counters Sleep/Toxic/Burn/Para leads) and Mist (blocks stat drops for 5 turns
-    — counters Charm/Screech/Growl). Both invisible to prior agents.
-    """
+    """5-dim binary flags: [spikes, reflect, light_screen, safeguard, mist]."""
     vec = np.zeros(5, dtype=np.float32)
     if not side_conditions:
         return vec
@@ -1304,15 +1089,8 @@ def _encode_side_conditions_for(side_conditions) -> np.ndarray:
     return vec
 
 
-# -----------------------------
-# Agent23: Active-mon counters and substitute (10 new dims at obs tail)
-# -----------------------------
 def _get_status_counter(mon) -> int:
-    """
-    Raw status_counter from poke-env. For asleep mons, counts turns slept; for
-    badly poisoned (TOX), counts toxic stacks (damage = N/16 per turn). Defensive
-    getattr — falls back to private _status_counter if the public alias is absent.
-    """
+    """Raw status_counter: turns slept (SLP) or toxic stacks (TOX)."""
     if mon is None:
         return 0
     val = getattr(mon, "status_counter", None)
@@ -1322,22 +1100,14 @@ def _get_status_counter(mon) -> int:
 
 
 def _get_sleep_counter_norm(mon) -> float:
-    """
-    Sleep turn counter / 7.0, clipped to [0, 1]. 0.0 if not asleep. Sleep in
-    Gen 2 lasts 1-7 turns — knowing "wakes next turn" vs "asleep 5 more" is a
-    huge signal the bot was missing entirely.
-    """
+    """Sleep turns / 7.0 clipped to [0, 1]. 0.0 if not asleep."""
     if mon is None or not _is_asleep(mon):
         return 0.0
     return min(_get_status_counter(mon) / 7.0, 1.0)
 
 
 def _get_toxic_counter_norm(mon) -> float:
-    """
-    Toxic stack counter / 15.0, clipped to [0, 1]. 0.0 if not toxic-poisoned.
-    Toxic damage escalates 1/16 -> 2/16 -> ... per turn — a 1-stack vs 8-stack
-    target plays completely differently.
-    """
+    """Toxic stacks / 15.0 clipped to [0, 1]. 0.0 if not badly poisoned."""
     if mon is None:
         return 0.0
     try:
@@ -1352,13 +1122,7 @@ def _get_toxic_counter_norm(mon) -> float:
 
 
 def _has_substitute(mon) -> float:
-    """
-    1.0 if mon is currently behind a Substitute, 0.0 otherwise. Sub blocks status
-    moves, stat boost/drops, and absorbs damage up to its HP. Sub-CM Suicune,
-    Sub-Petaya users, etc. are central to Gen 2 randombattle; bot was blind to them.
-    Defensive lookup against poke-env's Effect dict — accepts either public
-    `effects` or private `_effects`, and matches by name to avoid hard import.
-    """
+    """1.0 if mon is behind a Substitute, 0.0 otherwise."""
     if mon is None:
         return 0.0
     effects = getattr(mon, "effects", None)
@@ -1378,39 +1142,12 @@ def _has_substitute(mon) -> float:
 
 def embed_battle_impl(battle, gen_data) -> np.ndarray:
     """
-    THE canonical 794-dim observation builder. Used by BOTH training (CustomEnv.embed_battle)
-    and inference (InferenceAgent._embed). Any change here applies to both paths automatically.
-
-    Layout (794 dims, all own-team-indexed slots use insertion order to match the action layer;
-    opp-team-indexed slots use discovery order):
-      moves_base_power 4, moves_dmg_multiplier 4, moves_pp_ratio 4,
-      team_hp_ratio 6, opponent_hp_ratio 6,
-      team_identifier 6, opponent_identifier 6,
-      self_status 6, opponent_status 6, special_case 2,
-      active_features 37, opp_active_features 37,
-      own_speed 1, opp_speed 1, opp_move_eff 4,
-      own_boosts 5, opp_boosts 5,
-      own_status_flags 5, opp_status_flags 5,
-      turn_counter 1, own_alive_flags 6, opp_alive_flags 6,
-      bench_off_multiplier 6, bench_def_vulnerability 6,
-      matchup_features 3, weather 4,
-      own_side_conditions 5, opp_side_conditions 5,    (Agent23: 3->5, +Safeguard +Mist)
-      own_slot_features 252, opp_slot_features 252,
-      opp_seen_flags 6, own_is_active 6, opp_is_active 6,
-      force_switch_flag 1, speed_advantage_flag 1,
-      moves_type_onehot 72,                            (Agent21 — 4 own moves × 18-dim type one-hot)
-      sleep_counter_own 1, sleep_counter_opp 1,        (Agent23 — turns slept / 7)
-      toxic_counter_own 1, toxic_counter_opp 1,        (Agent23 — toxic stack / 15)
-      substitute_own 1, substitute_opp 1               (Agent23 — behind sub flag)
+    Canonical OBS_SIZE-dim observation builder. Used by both training and inference.
+    Own-team slots use insertion order; opp-team slots use discovery order.
     """
     try:
         moves_n, pokemon_team = 4, 6
-        # Agent23 bug fixes:
-        #   moves_dmg_multiplier: was np.ones (=1.0 = "super-effective" in clip(mult-1, -1, 1)
-        #     encoding). Empty slots / no-opp / silent assert all leaked super-eff signal.
-        #   moves_pp_ratio: was np.zeros (=0.0 = "50% PP" in (pp/max)*2-1 encoding).
-        #     Empty slots looked like half-used moves.
-        # moves_base_power default of -1.0 was already correct (matches BP=0 encoding).
+        # Defaults: base_power=-1 (no move/status), dmg_mult=0 (neutral), pp_ratio=-1 (empty).
         moves_base_power     = -np.ones(moves_n)
         moves_dmg_multiplier = np.zeros(moves_n)
         moves_pp_ratio       = -np.ones(moves_n)
@@ -1422,23 +1159,17 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         opponent_status      = np.zeros(pokemon_team, dtype=np.float32)
         special_case         = np.zeros(2, dtype=np.float32)
 
-        # Insertion order throughout — matches the action layer (mask + action_to_order).
-        # Earlier code mixed sorted-by-key and insertion order across HP/status/alive_flags,
-        # forcing the policy to untangle inconsistent slot mappings inside one obs vector.
+        # All own-team iteration uses insertion order to match the action layer.
         for i, mon in enumerate(battle.team.values()):
             team_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
         for i, mon in enumerate(battle.opponent_team.values()):
             opponent_hp_ratio[i] = -1.0 if (mon.fainted or mon.max_hp == 0) else (mon.current_hp / mon.max_hp) * 2 - 1
 
-        # Index moves by the active mon's slot order — the SAME order the action layer
-        # (mask + action_to_order) uses. Iterating battle.available_moves instead causes
-        # an index/action mismatch whenever any move is disabled or out of PP.
+        # Indexed by active mon's slot order (not available_moves) to stay in sync with mask_env.
         if battle.active_pokemon is not None:
             own_moves = list(battle.active_pokemon.moves.values())[:moves_n]
             for i, move in enumerate(own_moves):
                 try:
-                    # Agent23: was `else 0.0`. None and 0 BP now map to the same -1.0
-                    # — status moves (None or 0 BP) no longer look like 125 BP attackers.
                     moves_base_power[i] = (move.base_power / 250) * 2 - 1 if move.base_power else -1.0
                     if battle.opponent_active_pokemon is not None:
                         moves_dmg_multiplier[i] = np.clip(
@@ -1480,12 +1211,7 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         opp_status_flags = _encode_status_flags(battle.opponent_active_pokemon)
         turn_counter = np.float32([min(battle.turn / 150.0, 1.0)])
 
-        # own_alive_flags pads with 1.0 because we always know all 6 own mons —
-        # short team would mean a malformed battle. opp_alive_flags now pads with
-        # 0.0: prior agents couldn't tell "5 unseen opps" from "5 healthy seen
-        # opps", which broke endgame mon-counting. opp_seen_flags below carries
-        # the "have I seen this slot yet" signal so the policy can recover the
-        # old "presumed alive" interpretation when needed.
+        # opp_alive_flags pads with 0.0 (unseen ≠ alive); opp_seen_flags distinguishes seen vs unseen.
         own_alive_flags = np.float32([0.0 if mon.fainted else 1.0
                                       for mon in battle.team.values()]
                                      + [1.0] * (6 - len(battle.team)))
@@ -1500,8 +1226,6 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         own_side_conditions     = _encode_side_conditions_for(getattr(battle, "side_conditions", {}))
         opp_side_conditions     = _encode_side_conditions_for(getattr(battle, "opponent_side_conditions", {}))
 
-        # Agent16: per-slot rich features (types + base stats), seen flags,
-        # is-active one-hots, force-switch flag, speed-advantage flag.
         own_slot_features  = _get_team_slot_features(battle, gen_data)
         opp_slot_features  = _get_opp_slot_features(battle, gen_data)
         opp_seen_flags     = _get_opp_seen_flags(battle)
@@ -1510,13 +1234,8 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         force_switch_flag  = np.float32([1.0 if getattr(battle, "force_switch", False) else 0.0])
         speed_advantage    = _get_speed_advantage(battle, gen_data)
 
-        # Agent21: explicit move type one-hots — 4 × 18 = 72 dims appended at end.
-        # Tail-only placement keeps OWN_SLOT_OFFSET and OPP_SLOT_OFFSET unchanged.
         moves_type_onehot  = _get_own_move_types_for(battle)
 
-        # Agent23: sleep/toxic counters and substitute flag for both active mons.
-        # 6 dims at the very tail — slot offsets unchanged. Side-condition expansion
-        # (3->5) above shifts OWN/OPP_SLOT_OFFSET by +4 (handled in constants.py).
         own_active = battle.active_pokemon
         opp_active = battle.opponent_active_pokemon
         sleep_counter_own  = np.float32([_get_sleep_counter_norm(own_active)])
@@ -1525,6 +1244,9 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         toxic_counter_opp  = np.float32([_get_toxic_counter_norm(opp_active)])
         substitute_own     = np.float32([_has_substitute(own_active)])
         substitute_opp     = np.float32([_has_substitute(opp_active)])
+
+        own_action_history = _get_own_action_history(battle)
+        own_move_categories = _get_own_move_categories(battle)
 
         return np.float32(np.concatenate([
             moves_base_power, moves_dmg_multiplier, moves_pp_ratio,
@@ -1546,10 +1268,9 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
             sleep_counter_own, sleep_counter_opp,
             toxic_counter_own, toxic_counter_opp,
             substitute_own, substitute_opp,
+            own_action_history, own_move_categories,
         ]))
     except Exception as e:
-        # Surface embedding failures — silent zero-vectors hid bugs and produced
-        # blind policy decisions during training. Limit log spam with a counter.
         embed_battle_impl._error_count = getattr(embed_battle_impl, "_error_count", 0) + 1
         if embed_battle_impl._error_count <= 5 or embed_battle_impl._error_count % 100 == 0:
             logging.getLogger(__name__).warning(
@@ -1558,10 +1279,9 @@ def embed_battle_impl(battle, gen_data) -> np.ndarray:
         return np.zeros(OBS_SIZE, dtype=np.float32)
 
 
-# -----------------------------
-# Masking function
-# -----------------------------
 def mask_env(env):
+    # Returns an 11-element binary mask; 1 = legal action this turn.
+    # Passed to ActionMasker so PPO never samples an illegal action during rollout.
     battle = env.env.battle1
     action_mask = np.zeros(env.action_space.n, dtype=np.int8)
 
@@ -1587,11 +1307,6 @@ def mask_env(env):
     boosts = own_mon.boosts if own_mon.boosts is not None else {}
     gen_data = getattr(env.env, "gen_data", None)
 
-    # --- Build move mask ---
-    # Old condition was `not force_switch OR not active.fainted` — i.e. only
-    # suppressed moves when BOTH force_switch AND active was fainted. Saved by
-    # available_moves being empty during force_switch, but the boolean intent
-    # was inverted. Correct rule: no moves when forced to switch.
     if not battle.force_switch:
         for slot, move in enumerate(moves):
             if move not in available_moves:
@@ -1599,11 +1314,7 @@ def mask_env(env):
             if _is_move_allowed(move, own_mon, battle, boosts, own_incapacitated, gen_data=gen_data):
                 action_mask[slot + move_offset] = 1
 
-    # Agent26: hard switch-loop guard. After 2 consecutive voluntary switches,
-    # block switching on this turn — unless forced (KO replacement) or
-    # incapacitated (asleep/frozen with no available moves) where switching is
-    # the only legal option. Without this, A25 still hit ep_len_mean ~43.5
-    # because the soft -0.01 penalty was dominated by other reward signals.
+    # After 2 consecutive voluntary switches, block switching unless forced or incapacitated.
     consec_sw = getattr(env.env, "_consec_voluntary_switches", 0)
     block_voluntary_switch = (
         consec_sw >= 2
@@ -1612,7 +1323,6 @@ def mask_env(env):
         and any(action_mask[move_offset:move_offset + 4])
     )
 
-    # --- Build switch mask ---
     allow_switch = battle.force_switch or own_incapacitated or len(available_moves) > 0
     if allow_switch and not block_voluntary_switch:
         for slot, mon in enumerate(team):
@@ -1625,36 +1335,20 @@ def mask_env(env):
     return action_mask
 
 
-# -----------------------------
-# Learning rate schedule
-# -----------------------------
 def linear_lr_schedule(initial_lr: float):
-    """
-    Linearly decays LR from initial_lr to 0.5 * initial_lr as progress goes 1.0 -> 0.0.
-    Floor was 0.05 — that drove end-of-run LR to ~5e-6, killing clip_fraction/KL and
-    freezing the policy (Agent9 symptom). 0.5 keeps gradients meaningful throughout.
-    """
+    """Linearly decays LR from initial_lr to 0.5 * initial_lr (floor prevents gradient death)."""
     floor = initial_lr * 0.5
     def schedule(progress_remaining: float) -> float:
         return max(initial_lr * progress_remaining, floor)
     return schedule
 
 
-# -----------------------------
-# Parallel env factory
-# -----------------------------
 def make_env_fn(env_id: int, seed: int = 0, battle_format: str = "gen2randombattle", use_opponent_cycle: bool = True, opponent_env_id: int = -1, opponent_class=None, opponent_classes=None):
+    # Factory passed to DummyVecEnv/SubprocVecEnv. Each env gets a unique seed + staggered startup.
     def _init():
         set_random_seed(seed + env_id)
-        # Stagger startup to avoid the thundering-herd at the local Showdown server:
-        # when N subprocesses all open websockets and challenge each other in the same
-        # ~10ms, the handshake can stall long enough to exceed challenge_timeout. A
-        # small per-env delay flattens the connection spike.
-        time.sleep(env_id * 2.0)
-        # opponent_env_id overrides env_id for opponent selection (used by eval to
-        # pin a specific opponent without changing the env's own unique id).
+        time.sleep(env_id * 2.0)  # stagger startup to avoid thundering-herd on Showdown server
         opp_id = opponent_env_id if opponent_env_id >= 0 else env_id
-        # opponent_classes (list) takes precedence: pick per-env class by cycling.
         per_env_class = opponent_class
         if opponent_classes:
             per_env_class = opponent_classes[env_id % len(opponent_classes)]
@@ -1670,6 +1364,8 @@ def make_env_fn(env_id: int, seed: int = 0, battle_format: str = "gen2randombatt
 
 
 def make_vec_env(n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle", use_opponent_cycle: bool = True, fixed_env_id: int = -1, opponent_class=None, opponent_classes=None):
+    # SubprocVecEnv for parallel training (each env runs in its own process);
+    # DummyVecEnv for evaluation or debugging where subprocess overhead isn't worth it.
     env_fns = [make_env_fn(env_id=i, seed=42, battle_format=battle_format, use_opponent_cycle=use_opponent_cycle, opponent_env_id=fixed_env_id, opponent_class=opponent_class, opponent_classes=opponent_classes) for i in range(n_envs)]
     if opponent_classes:
         names = [c.__name__ for c in opponent_classes]

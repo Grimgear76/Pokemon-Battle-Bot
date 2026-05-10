@@ -15,7 +15,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.utils import set_random_seed
 
 from poke_env.data import GenData
-from poke_env.player import Player
+from poke_env.player import Player, SimpleHeuristicsPlayer
 from poke_env.environment import SingleAgentWrapper
 from poke_env import AccountConfiguration, LocalhostServerConfiguration
 
@@ -45,35 +45,11 @@ from environment import (
     _RUN_SUFFIX,
 )
 
-# -----------------------------
-# Slot-equivariant feature extractor (Agent19+)
-# -----------------------------
 class SlotEquivariantExtractor(BaseFeaturesExtractor):
     """
-    Slot-equivariant feature extractor for Pokemon obs.
-
-    Splits the OBS_SIZE-dim obs into:
-      - own_slot_features [252]  → 6 slots × 42 dims (type1, type2, base_stats)
-      - opp_slot_features [252]  → 6 slots × 42 dims
-      - rest [OBS_SIZE - 504]   → all global / active / scalar features
-        (Agent20: 208, Agent21: 280 after appending 72 move-type-onehot dims)
-
-    Applies a SHARED 2-layer MLP per slot (42 → SLOT_HIDDEN), encoding each
-    Pokemon-slot into the same embedding space regardless of which slot it
-    sits in. Concatenates the per-slot embeddings with the rest of the obs.
-
-    Output dim: (OBS_SIZE - 504) + 2 * N_SLOTS * SLOT_HIDDEN  (= 674 with
-    Agent23 defaults: 794 obs, 290 non-slot + 384 slot embedding; was 664
-    in Agent21, 592 in Agent20). non_slot_dim is computed from
-    observation_space.shape, so this adapts whenever OBS_SIZE changes.
-
-    Why: Agent16-18 fed the full 252+252-dim slot blocks into a flat MLP, so
-    the policy had to learn a separate 42-dim Pokemon encoding for each of
-    the 12 slot positions. That capacity waste shows up as "value head
-    excellent, policy stuck" — the value net can lean on the rest of the
-    obs (matchup, hp, alive flags), but the policy needs slot-symmetric
-    reasoning to decide WHICH bench mon to switch to. Sharing one MLP across
-    slots gives the policy exactly that symmetry for free.
+    Shared per-slot MLP (42 → SLOT_HIDDEN) applied to all 12 own+opp slot blocks.
+    Concatenates per-slot embeddings with the non-slot obs head+tail.
+    Output dim: (OBS_SIZE - 504) + 2 * N_SLOTS * SLOT_HIDDEN.
     """
 
     def __init__(self, observation_space, slot_hidden: int = SLOT_HIDDEN):
@@ -88,7 +64,6 @@ class SlotEquivariantExtractor(BaseFeaturesExtractor):
         self._non_slot_dim = non_slot_dim
         self._slot_hidden  = slot_hidden
 
-        # Shared 2-layer MLP applied to every slot (own + opp).
         self.slot_mlp = nn.Sequential(
             nn.Linear(SLOT_DIM, slot_hidden),
             nn.ReLU(),
@@ -96,7 +71,6 @@ class SlotEquivariantExtractor(BaseFeaturesExtractor):
         )
 
     def forward(self, obs: th.Tensor) -> th.Tensor:
-        # obs: (B, OBS_SIZE) — slot offsets unchanged across Agent20/21 (tail grows).
         own_slots = obs[:, OWN_SLOT_OFFSET : OWN_SLOT_OFFSET + SLOT_BLOCK_LEN]
         opp_slots = obs[:, OPP_SLOT_OFFSET : OPP_SLOT_OFFSET + SLOT_BLOCK_LEN]
         # rest = everything OUTSIDE the two slot blocks (head + tail).
@@ -112,16 +86,9 @@ class SlotEquivariantExtractor(BaseFeaturesExtractor):
         return th.cat([head, tail, own_emb, opp_emb], dim=1)
 
 
-# -----------------------------
-# Policy kwargs helper
-# -----------------------------
 def make_policy_kwargs() -> dict:
-    """
-    Policy kwargs used by build_model (new training). Loading existing models
-    via MaskablePPO.load() does NOT pass this — SB3 reconstructs the policy
-    from the saved metadata, which keeps Agent14-18 (no extractor) and
-    Agent19+ (with extractor) loadable through the same code path.
-    """
+    # Builds the policy_kwargs dict for MaskablePPO. Injects the slot-equivariant extractor
+    # when enabled so the shared per-slot MLP is used instead of a flat input layer.
     kwargs = dict(net_arch=NET_ARCH)
     if USE_SLOT_EQUIVARIANT:
         kwargs["features_extractor_class"]  = SlotEquivariantExtractor
@@ -129,12 +96,11 @@ def make_policy_kwargs() -> dict:
     return kwargs
 
 
-# -----------------------------
-# Build model
-# -----------------------------
 def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
+    # Constructs a fresh MaskablePPO with all hyperparameters from constants.py.
+    # Uses a linear LR schedule that floors at 50% to avoid gradient death late in training.
     return MaskablePPO(
-        "MlpPolicy",  # ActionMasker in this version of sb3_contrib keeps obs as flat Box — MlpPolicy is correct
+        "MlpPolicy",
         env,
         verbose=0,
         learning_rate=linear_lr_schedule(LEARNING_RATE),
@@ -152,9 +118,6 @@ def build_model(env, tensorboard_log="./tensorboard_logs/", model_name="model"):
     )
 
 
-# -----------------------------
-# Shared helper: walk wrapper chain to find CustomEnv
-# -----------------------------
 def _get_custom_env(vec_env, i: int = 0):
     inner = vec_env.envs[i]
     while inner is not None:
@@ -164,17 +127,14 @@ def _get_custom_env(vec_env, i: int = 0):
     return None
 
 
-# -----------------------------
-# Train new
-# -----------------------------
 def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
+    # Creates a brand-new model and trains from scratch. Fails fast if the save already exists.
     path = model_path(model_name)
     if path.exists():
         print(f"Model '{model_name}' already exists! Delete it or choose another name.")
         return
 
     print(f"[Training Started] model={model_name}, timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}")
-    # New models train against Random only for broad exploration
     train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format, use_opponent_cycle=False)
     model = build_model(train_env, model_name=model_name)
 
@@ -193,16 +153,14 @@ def train_new(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc
     print(f"[Model Saved] {model_name}")
 
 
-# -----------------------------
-# Continue training
-# -----------------------------
 def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle", opponent: str = "mix"):
+    # Resumes an existing checkpoint. Overrides all hyperparameters from the saved model
+    # with current constants (LR, ent_coef, etc.) so tweaks take effect without retraining.
+    # Uses a constant LR rather than a schedule since training is continuing mid-curve.
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found! Train a new model first.")
         return
-
-    from poke_env.player import SimpleHeuristicsPlayer
 
     opp = opponent.lower()
     if opp in ("max", "maxdamage"):
@@ -210,16 +168,12 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
     elif opp in ("heuristic", "heuristics", "simple"):
         opp_classes = [SimpleHeuristicsPlayer]
     elif opp == "mix":
-        # 2:1 MaxDamage:Heuristic ratio across envs
-        opp_classes = [MaxDamagePlayer, MaxDamagePlayer, SimpleHeuristicsPlayer]
+        opp_classes = [MaxDamagePlayer, MaxDamagePlayer, SimpleHeuristicsPlayer]  # 2:1 ratio
     else:
         raise ValueError(f"Unknown opponent '{opponent}' — expected 'maxdamage', 'heuristic', or 'mix'")
 
     print(f"[Continuing Training] model={model_name}, additional timesteps={timesteps:,}, n_envs={n_envs}, format={battle_format}, opponent={opp}")
     train_env = make_vec_env(n_envs=n_envs, use_subproc=use_subproc, battle_format=battle_format, use_opponent_cycle=False, opponent_classes=opp_classes)
-    # No policy_kwargs override — SB3 reconstructs from the saved metadata so
-    # Agent14-18 (flat MLP) and Agent19+ (slot-equivariant extractor) both load
-    # correctly through this same code path.
     model = MaskablePPO.load(
         path,
         env=train_env,
@@ -227,16 +181,16 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
         custom_objects={"clip_range": lambda _: CLIP_RANGE},
     )
 
-    model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
+    model.learning_rate = LEARNING_RATE  # constant LR for continuation (no decay schedule)
     for param_group in model.policy.optimizer.param_groups:
         param_group["lr"] = LEARNING_RATE
-    model.ent_coef = ENT_COEF  # override entropy coef from constants.py (saved model may have stale value)
-    model.vf_coef = VF_COEF    # override vf_coef so value learning gets the updated weight
-    model.gae_lambda = GAE_LAMBDA  # 0.95 → 0.92: tighter lambda reduces advantage variance
-    model.n_epochs = N_EPOCHS      # 10 → 12: kl well below target, more updates per rollout
-    model.clip_range = lambda _: CLIP_RANGE  # override saved clip_range (sb3 stores it as a schedule callable)
-    model.target_kl = TARGET_KL    # override target_kl from constants.py
-    model.gamma = GAMMA            # Agent19: 0.99 → 0.995, longer credit assignment
+    model.ent_coef   = ENT_COEF
+    model.vf_coef    = VF_COEF
+    model.gae_lambda = GAE_LAMBDA
+    model.n_epochs   = N_EPOCHS
+    model.clip_range = lambda _: CLIP_RANGE
+    model.target_kl  = TARGET_KL
+    model.gamma      = GAMMA
 
     callbacks = CallbackList([
         ProgressCallback(timesteps, n_envs=n_envs),
@@ -254,13 +208,10 @@ def train_continue(model_name: str, timesteps: int, n_envs: int = N_ENVS, use_su
     print(f"[Model Saved] {model_name}")
 
 
-# -----------------------------
-# Eval vs built-in opponent
-# -----------------------------
 def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2randombattle", opponent: str = "max"):
-    """
-    opponent: "max" | "heuristic" | "random"
-    """
+    # Runs the model deterministically (no exploration) against a scripted opponent
+    # and reports win/loss/draw counts. Uses a single DummyVecEnv to keep results sequential.
+    """opponent: "max" | "heuristic" | "random" """
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found!")
@@ -316,9 +267,8 @@ def eval_model(model_name: str, n_battles: int = 100, battle_format: str = "gen2
     return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / n_battles}
 
 
-# -----------------------------
-# Eval model1 vs model2
-# -----------------------------
+# Pits two saved models against each other. The opponent is frozen (no gradient) and
+# wrapped as an InferenceAgent so it acts via the same action-masking logic as training.
 def eval_model_vs_model(
     challenger_name: str,
     opponent_name: str,
@@ -412,26 +362,14 @@ def eval_model_vs_model(
     return {"wins": wins, "losses": losses, "draws": draws, "win_rate": wins / n_battles}
 
 
-# -----------------------------
-# Inference Agent
-# -----------------------------
 class InferenceAgent(Player):
-    """
-    Standalone inference player used for model-vs-model eval and human play.
-    _embed() must stay in sync with CustomEnv.embed_battle() in environment.py.
-    Current layout: 794 dims (see constants.py OBS_SIZE comment for breakdown).
-    """
+    """Standalone inference player for eval and human play."""
     def __init__(self, model, **kwargs):
         super().__init__(**kwargs)
         self._model = model
         self._gen_data = GenData.from_gen(2)
 
     def _embed(self, battle) -> np.ndarray:
-        """
-        Inference-side observation builder. Delegates to environment.embed_battle_impl —
-        the SAME function used by training (CustomEnv.embed_battle). This is the only
-        way to guarantee P1 and P2 see byte-identical OBS_SIZE-dim vectors. Do not re-implement.
-        """
         return embed_battle_impl(battle, self._gen_data)
 
     def _build_mask(self, battle) -> np.ndarray:
@@ -487,19 +425,15 @@ class InferenceAgent(Player):
             return self.choose_random_move(battle)
 
 
-# -----------------------------
-# Async Inference Agent (websocket / human play only)
-# -----------------------------
 class AsyncInferenceAgent(InferenceAgent):
-    """Async choose_move for poke-env websocket use (play vs human)."""
+    """Wraps InferenceAgent with an async choose_move for the poke-env websocket loop."""
     async def choose_move(self, battle):
         return InferenceAgent.choose_move(self, battle)
 
 
-# -----------------------------
-# Play vs Human
-# -----------------------------
 async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1, battle_format: str = "gen2randombattle"):
+    # Logs the bot into the local Showdown server and waits for a human challenge.
+    # Uses AsyncInferenceAgent so the async websocket loop doesn't block.
     path = model_path(model_name)
     if not path.exists():
         print(f"Model '{model_name}' not found!")
@@ -529,10 +463,9 @@ async def play_vs_human(model_name: str, human_username: str, n_battles: int = 1
     print(f"\n[Results] Bot: {wins}W / {losses}L / {draws}D")
 
 
-# -----------------------------
-# League / Ladder Training
-# -----------------------------
 def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_envs: int = N_ENVS, use_subproc: bool = True, battle_format: str = "gen2randombattle"):
+    # League training: learner trains against a specific frozen saved model.
+    # The opponent never updates during this run (frozen weights = stable target).
     learner_path  = model_path(learner_name)
     opponent_path = model_path(opponent_name)
 
@@ -585,7 +518,7 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
             tensorboard_log="./tensorboard_logs/",
             custom_objects={"clip_range": lambda _: CLIP_RANGE},
         )
-        model.learning_rate = LEARNING_RATE  # constant for continuation: avoids fractional LR from schedule
+        model.learning_rate = LEARNING_RATE
         for param_group in model.policy.optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE
         model.ent_coef   = ENT_COEF
@@ -617,10 +550,6 @@ def train_vs_opponent(learner_name: str, opponent_name: str, timesteps: int, n_e
     print(f"[League] Saved {learner_name}")
 
 
-# -----------------------------
-# Self-Play training
-# -----------------------------
-# Builtin opponent tokens accepted in the opponent_pool list (case-insensitive).
 _BUILTIN_OPPONENTS = {"random", "heuristic", "heuristics", "max", "maxdamage"}
 
 
@@ -630,27 +559,16 @@ def _make_self_play_env_fn(
     battle_format: str,
     seed: int = 42,
 ):
-    """
-    Build an env factory whose opponent is decided by `opponent_token`:
-      - "random" / "heuristic" / "max"  → builtin scripted player
-      - any other string                → InferenceAgent loaded from models/<token>.zip
-    The model is loaded INSIDE the subprocess so we don't pickle it across the
-    SubprocVecEnv boundary (which would force every model in the pool through
-    the parent process even if only one env uses it).
-    """
+    """Builtin token → scripted player; model name → InferenceAgent loaded inside subprocess."""
     token_lower = opponent_token.lower()
     is_builtin = token_lower in _BUILTIN_OPPONENTS
     opp_path = None if is_builtin else str(model_path(opponent_token))
 
     def _init():
-        # Imports happen in the subprocess so _RUN_SUFFIX is the SUBPROCESS's
-        # freshly-generated suffix (per-process unique usernames), not the
-        # parent's. environment.py is re-imported when SubprocVecEnv spawns.
         from poke_env.player import RandomPlayer, SimpleHeuristicsPlayer
         from environment import MaxDamagePlayer, _RUN_SUFFIX
 
         set_random_seed(seed + env_id)
-        # Stagger startup — same reason as make_env_fn in environment.py.
         time.sleep(env_id * 2.0)
 
         agent_config    = AccountConfiguration(f"agt_{env_id}_{_RUN_SUFFIX}", None)
@@ -675,8 +593,6 @@ def _make_self_play_env_fn(
             else:  # max / maxdamage
                 opponent = MaxDamagePlayer(start_listening=False, account_configuration=opponent_config)
         else:
-            # Frozen learner — load with NO policy_kwargs override so any saved arch
-            # (Agent14-18 flat MLP, Agent19+ slot-equivariant) reconstructs cleanly.
             opp_model = MaskablePPO.load(opp_path, custom_objects={"clip_range": lambda _: CLIP_RANGE})
             opponent = InferenceAgent(
                 model=opp_model,
@@ -701,21 +617,9 @@ def train_self_play(
     battle_format: str = "gen2randombattle",
     seed_from: str = None,
 ):
-    """
-    Train `learner_name` against a pool of opponents distributed round-robin
-    across n_envs. Each pool entry is one of:
-      - "random" / "heuristic" / "max"  → builtin scripted player
-      - <model_name>                    → InferenceAgent loaded from models/<name>.zip
-
-    Mixing builtins with frozen past learners (e.g.
-    ["Agent14", "Agent17", "Agent18", "heuristic", "max"]) is recommended:
-    the builtins anchor the policy against forgetting, while the frozen
-    learners push it past the ~55%/45% Heuristics/MaxDamage ceiling that
-    Agent14-18 all bumped into.
-    """
+    """Train against a pool distributed round-robin across envs. Mix builtins and frozen models."""
     learner_path = model_path(learner_name)
 
-    # Validate pool: drop missing model checkpoints up-front.
     valid_pool: list = []
     for entry in opponent_pool:
         if entry.lower() in _BUILTIN_OPPONENTS:
@@ -758,12 +662,7 @@ def train_self_play(
         reset_timesteps = True
 
     if load_path is not None:
-        model = MaskablePPO.load(
-            load_path,
-            env=train_env,
-            tensorboard_log="./tensorboard_logs/",
-            custom_objects={"clip_range": lambda _: CLIP_RANGE},
-        )
+        model = MaskablePPO.load(load_path, env=train_env, tensorboard_log="./tensorboard_logs/", custom_objects={"clip_range": lambda _: CLIP_RANGE})
         model.learning_rate = LEARNING_RATE
         for param_group in model.policy.optimizer.param_groups:
             param_group["lr"] = LEARNING_RATE
